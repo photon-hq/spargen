@@ -3388,6 +3388,143 @@ fn rfc6570_multipart_parts_are_not_percent_encoded() {
     assert!(status.success(), "the multipart wire round-trip must pass");
 }
 
+/// A `multipart/related` request is already framed by the caller. The generated client must keep
+/// the caller's boundary-bearing Content-Type header and send every body byte unchanged instead of
+/// routing it through reqwest's multipart/form-data builder.
+#[test]
+fn multipart_related_preserves_boundary_and_preencoded_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(
+        &spec,
+        r##"
+openapi: 3.1.0
+info: { title: Attachments, version: 1.0.0 }
+paths:
+  /v1/projects/{id}/attachments:
+    post:
+      operationId: uploadAttachment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: content-length
+          in: header
+          required: true
+          schema: { type: string }
+        - name: content-type
+          in: header
+          required: true
+          schema: { type: string }
+        - name: idempotency-key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          multipart/related:
+            schema: { type: string, format: binary }
+      responses:
+        "204": { description: No Content }
+"##,
+    )
+    .unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "related_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+
+    std::fs::create_dir_all(out.join("tests")).unwrap();
+    std::fs::write(
+        out.join("tests/related.rs"),
+        r##"#![cfg(feature = "blocking")]
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
+#[test]
+fn boundary_header_and_body_are_preserved() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let expected_body = bytes::Bytes::from_static(
+        b"--photon-boundary\r\nContent-Type: application/json\r\n\r\n{\"name\":\"note\"}\r\n--photon-boundary\r\nContent-Type: application/octet-stream\r\n\r\n\x00\xffpayload\r\n--photon-boundary--\r\n",
+    );
+    let server_body = expected_body.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "request ended before its declared body length");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..position]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .expect("request carries Content-Length");
+            if request.len() >= position + 4 + content_length {
+                break position;
+            }
+        };
+
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        assert!(
+            headers.starts_with("POST /v1/projects/pho_prj_test/attachments HTTP/1.1"),
+            "{headers}"
+        );
+        assert!(
+            headers.to_ascii_lowercase().contains(
+                "content-type: multipart/related; boundary=photon-boundary"
+            ),
+            "{headers}"
+        );
+        assert_eq!(&request[header_end + 4..], server_body.as_ref());
+
+        stream
+            .write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let client = related_client::BlockingClient::new(&format!("http://{addr}")).unwrap();
+    client
+        .upload_attachment(
+            "pho_prj_test".to_owned(),
+            expected_body.len().to_string(),
+            "multipart/related; boundary=photon-boundary".to_owned(),
+            "attachment-attempt-1".to_owned(),
+            &expected_body,
+        )
+        .unwrap();
+    server.join().unwrap();
+}
+"##,
+    )
+    .unwrap();
+
+    let status = Command::new("cargo")
+        .args(["test", "--features", "blocking", "--test", "related"])
+        .current_dir(&out)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "the multipart/related wire round-trip must pass"
+    );
+}
+
 /// A crate that declares `uuid`/`time` as *optional* must be rejected.
 ///
 /// Generated code names `uuid::Uuid` and the date newtypes unconditionally — there is no `cfg` to

@@ -20,6 +20,10 @@ pub enum MediaType {
     /// `multipart/form-data` (request bodies): an object schema whose properties are the form
     /// parts — binary/bytes properties become file parts, scalars/composites become text parts.
     Multipart,
+    /// `multipart/related`: a complete caller-preencoded multipart message carried as raw bytes.
+    /// The operation's required `Content-Type` header parameter supplies the boundary that frames
+    /// those bytes; spargen deliberately does not rebuild the message as multipart/form-data.
+    MultipartRelated,
     /// `text/event-stream` (Server-Sent Events, response bodies): a stream of items decoded from
     /// the event `data:` fields. Lowered to a streaming operation returning `EventStream<T>`.
     EventStream,

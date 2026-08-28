@@ -83,6 +83,19 @@ pub fn lower(
                     .emit(ctx.diags);
             }
 
+            // Resolve the body once up front so parameter lowering knows whether Content-Type is a
+            // caller-owned multipart/related boundary. OpenAPI normally reserves that header to
+            // the protocol layer; a pre-encoded multipart/related body is the one supported case
+            // where the exact value cannot be inferred from the media-type key.
+            let request_body_object = operation
+                .request_body
+                .as_ref()
+                .and_then(|body| ctx.resolve_request_body(body));
+            let dynamic_content_type = request_body_object
+                .as_ref()
+                .and_then(|body| selected_media_type(&body.content))
+                == Some(MediaType::MultipartRelated);
+
             let mut params = Vec::new();
             let mut merged_parameters: IndexMap<(String, String), ParameterObject> =
                 IndexMap::new();
@@ -110,7 +123,7 @@ pub fn lower(
                 }
             }
             for parameter in merged_parameters.values() {
-                if let Some(parameter) = ctx.lower_parameter(parameter) {
+                if let Some(parameter) = ctx.lower_parameter(parameter, dynamic_content_type) {
                     params.push(parameter);
                 }
             }
@@ -151,11 +164,34 @@ pub fn lower(
                     .emit(ctx.diags);
             }
 
-            let request_body = operation
-                .request_body
+            let request_body = request_body_object
                 .as_ref()
-                .and_then(|body| ctx.resolve_request_body(body))
-                .and_then(|body| ctx.lower_request_body(&body));
+                .and_then(|body| ctx.lower_request_body(body));
+            if request_body
+                .as_ref()
+                .is_some_and(|body| body.media == MediaType::MultipartRelated)
+                && !params.iter().any(|parameter| {
+                    parameter.required
+                        && parameter.location == ParamLoc::Header
+                        && parameter.name.eq_ignore_ascii_case("content-type")
+                })
+            {
+                let at = request_body_object
+                    .as_ref()
+                    .map(|body| body.provenance.clone())
+                    .unwrap_or_else(|| operation.provenance.clone());
+                Diagnostic::error(Code::UnsupportedMediaType, at)
+                    .message(
+                        "a `multipart/related` request body requires a required `Content-Type` \
+                         header parameter so the caller can supply the framing boundary",
+                    )
+                    .remedy(
+                        "declare a required string header parameter named `Content-Type`, and pass \
+                         a value such as `multipart/related; boundary=...` that matches the \
+                         pre-encoded body bytes",
+                    )
+                    .emit(ctx.diags);
+            }
 
             let responses = ctx.lower_responses(&operation.responses);
             // XML decode is scoped to the single-body success/error paths. An XML body that would
@@ -2208,7 +2244,11 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         }
     }
 
-    fn lower_parameter(&mut self, parameter: &ParameterObject) -> Option<Parameter> {
+    fn lower_parameter(
+        &mut self,
+        parameter: &ParameterObject,
+        dynamic_content_type: bool,
+    ) -> Option<Parameter> {
         let location = match parameter.location.as_str() {
             "path" => ParamLoc::Path,
             "query" => ParamLoc::Query,
@@ -2225,14 +2265,20 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 return None;
             }
         };
-        // `Accept`, `Content-Type`, and `Authorization` header parameters "SHALL be ignored": the
-        // protocol layer owns those, and emitting a client argument for one would let a caller
-        // silently fight the codec or the auth attachment.
+        // `Accept`, `Content-Type`, and `Authorization` header parameters normally "SHALL be
+        // ignored": the protocol layer owns those, and emitting a client argument would let a
+        // caller silently fight the codec or auth attachment. A caller-preencoded
+        // `multipart/related` body is the exception: its boundary exists only in the complete
+        // Content-Type value, so that required parameter is deliberately preserved.
+        let is_dynamic_content_type = dynamic_content_type
+            && parameter.location.eq_ignore_ascii_case("header")
+            && parameter.name.eq_ignore_ascii_case("content-type");
         if location == ParamLoc::Header
             && matches!(
                 parameter.name.to_ascii_lowercase().as_str(),
                 "accept" | "content-type" | "authorization"
             )
+            && !is_dynamic_content_type
         {
             Diagnostic::warning(Code::DeclarationHasNoEffect, parameter.provenance.clone())
                 .message(format!(
@@ -2514,7 +2560,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         if let Some(ty) = ty {
             let compatible = match media {
                 MediaType::Text => raw_text_type_supported(&self.graph, ty),
-                MediaType::OctetStream => matches!(
+                MediaType::OctetStream | MediaType::MultipartRelated => matches!(
                     self.graph.get(ty.id).map(|definition| &definition.kind),
                     Some(TypeKind::Bytes)
                 ),
@@ -3041,7 +3087,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 if let Some(ty) = ty {
                     let compatible = match media {
                         MediaType::Text => raw_text_type_supported(&self.graph, ty),
-                        MediaType::OctetStream => matches!(
+                        MediaType::OctetStream | MediaType::MultipartRelated => matches!(
                             self.graph.get(ty.id).map(|definition| &definition.kind),
                             Some(TypeKind::Bytes)
                         ),
@@ -4261,6 +4307,21 @@ fn choose_media<'a, T>(
     None
 }
 
+/// Return the codec that deterministic media selection would choose, without emitting the
+/// alternative-media warning. Operation lowering uses this preview only to decide whether the
+/// otherwise-reserved Content-Type parameter carries a multipart/related boundary; the real
+/// selection and all diagnostics still happen exactly once in [`choose_media`].
+fn selected_media_type<T>(content: &IndexMap<String, T>) -> Option<MediaType> {
+    content
+        .keys()
+        .enumerate()
+        .filter_map(|(source_index, media)| {
+            classify_media(media_essence(media)).map(|(media, rank)| (rank, source_index, media))
+        })
+        .min_by_key(|(rank, source_index, _)| (*rank, *source_index))
+        .map(|(_, _, media)| media)
+}
+
 fn media_essence(media: &str) -> &str {
     media.split(';').next().unwrap_or(media).trim()
 }
@@ -4276,6 +4337,7 @@ fn classify_media(essence: &str) -> Option<(MediaType, u8)> {
         }
         "application/xml" | "text/xml" => (MediaType::Xml, 1),
         "multipart/form-data" => (MediaType::Multipart, 2),
+        "multipart/related" => (MediaType::MultipartRelated, 2),
         "application/x-www-form-urlencoded" => (MediaType::FormUrlEncoded, 3),
         "application/octet-stream" => (MediaType::OctetStream, 4),
         "text/event-stream" => (MediaType::EventStream, 6),

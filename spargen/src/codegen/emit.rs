@@ -405,10 +405,19 @@ pub(crate) fn emit_operation(
             api.types.get(ty.id).map(|def| &def.kind),
             Some(TypeKind::Bytes)
         ) {
-            quote! {
-                #request_binding = #request_binding
-                    .header(reqwest::header::CONTENT_TYPE, #content_type)
-                    .body(#body_binding.clone());
+            if media == MediaType::MultipartRelated {
+                // The required Content-Type operation parameter was attached above and includes
+                // the boundary that frames these caller-preencoded bytes. Replacing it with the
+                // bare media essence here would make the multipart message invalid.
+                quote! {
+                    #request_binding = #request_binding.body(#body_binding.clone());
+                }
+            } else {
+                quote! {
+                    #request_binding = #request_binding
+                        .header(reqwest::header::CONTENT_TYPE, #content_type)
+                        .body(#body_binding.clone());
+                }
             }
         } else {
             match media {
@@ -456,6 +465,8 @@ pub(crate) fn emit_operation(
                 MediaType::Multipart => {
                     emit_multipart_body(ty, api, names, request_binding, body_binding, &encoding)
                 }
+                // Lowering requires multipart/related to be raw bytes, handled before this match.
+                MediaType::MultipartRelated => quote! {},
                 // Streaming media are response-only; a streaming request body is rejected during
                 // lowering (narrowed `E009`), so this arm is unreachable for any emitted operation.
                 MediaType::EventStream | MediaType::Ndjson | MediaType::JsonSequence => quote! {},
