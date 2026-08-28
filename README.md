@@ -110,7 +110,8 @@ Implemented and verified today: the full pipeline for substantial 3.1 and 3.2 su
 schemas, objects, arrays, tuples, maps, scalar primitives and `format` mappings, homogeneous scalar enums,
 `$ref`s (including self- and mutually-recursive schemas, whose cycle-closing references are
 boxed), `allOf` merging, `oneOf`/`anyOf` unions, path/query/header/cookie parameters, JSON /
-form-urlencoded / octet-stream / text bodies, per-status responses (including multi-status
+form-urlencoded / octet-stream / text bodies, raw `multipart/related` binary bodies,
+per-status responses (including multi-status
 success/error bodies lowered to typed per-operation response enums), auth attachment, and the
 complete diagnostics surface (`check` / `explain`, `--format json`, stable codes,
 batch reporting). OpenAPI 3.2 adds canonical `$self` reference identity, `QUERY` and custom HTTP

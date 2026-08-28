@@ -2080,6 +2080,14 @@ paths:
               schema:
                 type: object
                 properties: { detail: { type: string } }
+  /related:
+    get:
+      responses:
+        "200":
+          description: complete multipart message
+          content:
+            multipart/related:
+              schema: { type: string, format: binary }
 "##;
     let generated = generate(spec);
     assert_ne!(generated.outcome, Outcome::Rejected, "{generated:#?}");
@@ -2108,6 +2116,24 @@ paths:
     );
     assert_eq!(report.outcome, Outcome::Rejected, "{report:#?}");
     assert!(has_code(&report, Code::UnsupportedMediaType));
+
+    let related = generate(
+        r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /x:
+    get:
+      responses:
+        "200":
+          description: multipart bytes cannot decode into an object
+          content:
+            multipart/related:
+              schema: { type: object, properties: { value: { type: string } } }
+"##,
+    );
+    assert_eq!(related.outcome, Outcome::Rejected, "{related:#?}");
+    assert!(has_code(&related, Code::UnsupportedMediaType));
 }
 
 #[test]
@@ -2569,6 +2595,83 @@ paths:
         !has_code(&checked, Code::UnsupportedMediaType),
         "{checked:#?}"
     );
+}
+
+#[test]
+fn multipart_related_binary_request_body_generates_with_dynamic_content_type() {
+    // `multipart/related` is framed by the caller because the schema describes the complete
+    // pre-encoded payload as bytes. The required Content-Type parameter carries the boundary that
+    // matches those bytes; unlike multipart/form-data, reqwest must not rebuild the body.
+    let spec = r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /attachments:
+    post:
+      operationId: uploadAttachment
+      parameters:
+        - name: content-type
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          multipart/related:
+            schema: { type: string, format: binary }
+      responses:
+        '204': { description: ok }
+"##;
+    let (report, code) = generate_with_code(spec);
+    assert_ne!(report.outcome, Outcome::Rejected, "{report:#?}");
+    assert!(
+        !has_code(&report, Code::DeclarationHasNoEffect),
+        "the dynamic Content-Type boundary must not be discarded: {report:#?}"
+    );
+    assert!(code.contains("content_type: types::ContentType"), "{code}");
+    assert!(
+        code.contains(".header(\n                \"content-type\""),
+        "{code}"
+    );
+    assert!(
+        code.contains("request = request.body(body.clone())"),
+        "{code}"
+    );
+
+    let checked = check(spec);
+    assert_ne!(checked.outcome, Outcome::Rejected, "{checked:#?}");
+    assert!(
+        !has_code(&checked, Code::DeclarationHasNoEffect),
+        "check/generate must agree that Content-Type is consumed: {checked:#?}"
+    );
+}
+
+#[test]
+fn e009_multipart_related_requires_a_required_content_type_header() {
+    let without_header = r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /attachments:
+    post:
+      requestBody:
+        required: true
+        content:
+          multipart/related:
+            schema: { type: string, format: binary }
+      responses:
+        '204': { description: ok }
+"##;
+    let optional_header = without_header.replace(
+        "      requestBody:",
+        "      parameters:\n        - name: content-type\n          in: header\n          required: false\n          schema: { type: string }\n      requestBody:",
+    );
+    for spec in [without_header, optional_header.as_str()] {
+        for report in [generate(spec), check(spec)] {
+            assert_eq!(report.outcome, Outcome::Rejected, "{report:#?}");
+            assert!(has_code(&report, Code::UnsupportedMediaType), "{report:#?}");
+        }
+    }
 }
 
 #[test]
