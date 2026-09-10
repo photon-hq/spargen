@@ -3062,6 +3062,18 @@ components:
     assert!(!has_code(&report, Code::AllOfIrreconcilable), "{report:#?}");
 }
 
+#[test]
+fn all_of_intersects_referenced_and_inline_unions_with_objects() {
+    let spec = include_str!("fixtures/allof-union.yaml");
+    for report in [generate(spec), check(spec)] {
+        assert_ne!(report.outcome, Outcome::Rejected, "{report:#?}");
+        assert!(!has_code(&report, Code::AllOfIrreconcilable), "{report:#?}");
+    }
+    let (_, code) = generate_with_code(spec);
+    assert!(code.contains("pub enum Received"), "{code}");
+    assert!(code.contains("pub struct SmsReceived"), "{code}");
+}
+
 /// A nested `allOf` (an `allOf` member that itself has an `allOf`) flattens recursively into one
 /// struct.
 #[test]

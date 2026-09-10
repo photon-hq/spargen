@@ -686,12 +686,10 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             return self.lower_type_array(schema, hint, &non_null_types);
         }
 
-        // A binary payload — `contentEncoding: base64` or `format: binary` (the OpenAPI file/upload
-        // marker) — lowers to raw `bytes::Bytes` rather than a `String`, so a multipart file part
-        // carries bytes and a byte body is not misdecoded as UTF-8.
-        if schema.content_encoding.as_deref() == Some("base64")
-            || schema.format.as_deref() == Some("binary")
-        {
+        // `format: binary` denotes a raw byte payload. `contentEncoding: base64` describes
+        // content INSIDE a JSON string; keep that string on the wire rather than mapping it
+        // to Bytes (whose JSON representation is an array and whose serde feature is optional).
+        if schema.format.as_deref() == Some("binary") {
             return Some(self.insert_schema_type(schema, hint, TypeKind::Bytes));
         }
 
@@ -1360,7 +1358,8 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
     ///   of `required`, and a conservatively intersected `additionalProperties` policy;
     /// * **all scalar members** → their typed intersection, including numeric narrowing, enum
     ///   narrowing, arrays/objects/unions, and exact nullability; an empty intersection → `E013`;
-    /// * an **object/scalar mix** → `E013`.
+    /// * **object and other typed members** → intersect the merged object with each member,
+    ///   narrowing union branches; an empty/unrepresentable intersection → `E013`.
     ///
     /// Every path inserts its result type as the *final* graph insert (all member/property/component
     /// types insert first), so an `allOf` used as a component body still satisfies the
@@ -1379,14 +1378,6 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 Contribution::Object { .. } => None,
             })
             .collect();
-
-        // Object-vs-scalar mix has no single representable type.
-        if has_object && !scalars.is_empty() {
-            return self.reject_all_of(
-                schema,
-                "an `allOf` mixes object and scalar members, which cannot form one type",
-            );
-        }
 
         // All-scalar allOf: recursively intersect compatible members (for example integer with
         // number, an enum with its underlying scalar, or arrays whose item constraints narrow).
@@ -1502,11 +1493,32 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             }
         }
 
-        let ty = self.insert_schema_type(
+        let mut ty = self.insert_schema_type(
             schema,
             hint,
             TypeKind::Struct(Struct { fields, additional }),
         );
+        // A non-object contribution can be a union of objects, not just a scalar. Reuse the
+        // typed intersection path so constraints reach every branch and incompatible branches
+        // are removed, while oneOf/anyOf matching semantics remain attached to the union.
+        for (index, member) in scalars.iter().copied().enumerate() {
+            let Some(intersection) =
+                self.intersect_types(ty, member, &format!("{hint}Intersection{index}"))
+            else {
+                return self.reject_all_of(
+                    schema,
+                    "`allOf` members have an empty or unrepresentable intersection",
+                );
+            };
+            ty = intersection;
+        }
+        if !scalars.is_empty() {
+            // Component roots must be the final graph insert, under their original public name.
+            let kind = self.graph.get(ty.id)?.kind.clone();
+            let nullable = ty.nullable;
+            ty = self.insert_schema_type(schema, hint, kind);
+            ty.nullable = nullable;
+        }
         Some(self.with_all_of_nullability(schema, ty))
     }
 
@@ -2221,8 +2233,8 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
     }
 
     /// A parameter is always rendered to a wire string — path/query/header/cookie interpolation or a
-    /// serialized content value — and `bytes::Bytes` (from `format: binary` / `contentEncoding:
-    /// base64`) is not `Display` and has no faithful string rendering. `format: binary` on a
+    /// serialized content value — and `bytes::Bytes` (from `format: binary`) is not `Display`
+    /// and has no faithful string rendering. `format: binary` on a
     /// parameter is conventionally just an opaque string, so a parameter whose type lowered to raw
     /// bytes is represented as a plain `String` instead — keeping the parameter renderable and
     /// matching the pre-`Bytes` behavior. Body/multipart binary lowering is unaffected.

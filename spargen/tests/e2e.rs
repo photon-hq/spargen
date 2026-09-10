@@ -68,11 +68,10 @@ serde = {{ version = "1.0.229", features = ["derive"] }}
 serde_json = "1.0.151"
 
 [build-dependencies]
-spargen = {{ path = {:?}, default-features = false }}
+spargen = {{ path = {spargen_path:?}, default-features = false }}
 
 [workspace]
-"#,
-            spargen_path
+"#
         ),
     )
     .unwrap();
@@ -204,6 +203,35 @@ fn runtime_dependency_floors_compile_with_direct_minimal_versions() {
         assert!(
             status.success(),
             "the declared runtime floors must compile for wasm"
+        );
+    }
+}
+
+#[test]
+fn all_of_union_intersections_compile_and_round_trip() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(&spec, include_str!("fixtures/allof-union.yaml")).unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "allof_union_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    let path = out.join("src/lib.rs");
+    let mut code = std::fs::read_to_string(&path).unwrap();
+    code.push_str(include_str!("fixtures/allof-union-runtime.rs"));
+    std::fs::write(path, code).unwrap();
+    for args in [
+        vec!["test"],
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"],
+    ] {
+        let output = Command::new("cargo")
+            .args(args)
+            .current_dir(&out)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
