@@ -1,0 +1,52 @@
+openapi: 3.1.0
+info: { title: Annotated references, version: 1.0.0 }
+paths:
+  /timestamp:
+    get:
+      operationId: getTimestamp
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Timestamp' } }
+components:
+  schemas:
+    CreatedAt:
+      $ref: '#/components/schemas/Timestamp'
+      description: First persistence time.
+    Timestamp: { type: string, format: date-time }
+    Unrelated: { type: object, additionalProperties: false }
+    UpdatedAt:
+      $ref: '#/components/schemas/Timestamp'
+      description: Last persistence time.
+    NullableTimestamp: { type: [string, 'null'], format: date-time }
+    NullableUpdatedAt:
+      $ref: '#/components/schemas/NullableTimestamp'
+      description: An optional update time.
+    Envelope:
+      type: object
+      properties:
+        createdAt: { $ref: '#/components/schemas/CreatedAt' }
+        updatedAt: { $ref: '#/components/schemas/UpdatedAt' }
+        nullableUpdatedAt: { $ref: '#/components/schemas/NullableUpdatedAt' }
+      required: [createdAt, updatedAt, nullableUpdatedAt]
+    Alias:
+      $ref: '#/components/schemas/Node'
+      description: A linked list.
+    Node:
+      type: object
+      properties:
+        value: { type: string }
+        next: { $ref: '#/components/schemas/Alias' }
+      required: [value]
+    NullableNode:
+      type: [object, 'null']
+      properties:
+        next: { $ref: '#/components/schemas/NullableAlias' }
+      required: [next]
+    NullableAlias:
+      $ref: '#/components/schemas/NullableAliasTarget'
+      description: A nullable recursive node.
+    NullableAliasTarget:
+      $ref: '#/components/schemas/NullableNode'
+      description: An alias of the node still being built.

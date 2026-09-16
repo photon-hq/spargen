@@ -51,6 +51,7 @@ pub fn lower(
         graph: TypeGraph::default(),
         components: HashMap::new(),
         in_progress: HashMap::new(),
+        pending_aliases: HashMap::new(),
         component_alias_stack: HashSet::new(),
         remote_components: HashMap::new(),
         remote_in_progress: HashMap::new(),
@@ -401,6 +402,9 @@ struct LowerCtx<'a, 'doc> {
     /// in this map is a cycle-closing back-edge and is boxed against the reserved id, carrying the
     /// same nullability a completed lowering would.
     in_progress: HashMap<String, (TypeId, bool)>,
+    /// Annotated aliases of a root whose body is still being lowered. Fill their
+    /// reserved slots when that target completes; never copy its Any placeholder.
+    pending_aliases: HashMap<TypeId, Vec<(String, TypeId, bool)>>,
     /// Guards chains of component aliases (`A -> B -> A`) that do not have a concrete schema body
     /// to enter the normal reserve/box recursion path.
     component_alias_stack: HashSet<String>,
@@ -472,11 +476,14 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             }
             return ty;
         };
-        // Nullability is a pure function of the component's own schema — the same inputs
-        // `lower_schema`/`lower_enum` use — so computing it once at reserve time lets every `$ref`
-        // consumer (cache hit, back-edge, or fresh) agree on it without waiting for the body to
-        // finish. No graph insert happens here, so the last-insert invariant below is preserved.
-        let nullable = schema_is_nullable(schema);
+        // Resolve nullability before reserving the root, including through aliases,
+        // so fresh, cached, and recursive references agree without waiting for its body.
+        let reference_alias = schema_is_reference_alias(schema);
+        let nullable = if reference_alias {
+            self.reference_alias_nullability(schema)?
+        } else {
+            schema_is_nullable(schema)
+        };
         // Reserve the root id before lowering the body so any back-edge encountered mid-body can
         // box a reference to it. The root's def is inserted last (children first) and then lifted
         // into this reserved slot, which keeps ids dense and stable.
@@ -486,6 +493,31 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         let lowered = self.lower_schema(schema, name);
         self.in_progress.remove(name);
         let mut ty = lowered?;
+        // An annotated $ref is parsed as a Schema, but lowering an annotation-only
+        // reference returns its target's existing type. Give this component its own
+        // final definition before the pop below: moving the target would leave its
+        // cached id dangling (and a later insert could silently reuse that id).
+        if reference_alias {
+            let definition = self.graph.get(ty.id)?;
+            if definition.name_hint.is_empty() {
+                // The target is a recursive ancestor with an unfinished body. Alias-only
+                // cycles were rejected by reference_alias_nullability above.
+                self.pending_aliases.entry(ty.id).or_default().push((
+                    name.to_owned(),
+                    root_id,
+                    nullable,
+                ));
+                self.in_progress
+                    .insert(name.to_owned(), (root_id, nullable));
+                return Some(Ty {
+                    id: root_id,
+                    nullable,
+                    boxed: true,
+                });
+            }
+            let kind = definition.kind.clone();
+            ty.id = self.insert_schema_type(schema, name, kind).id;
+        }
         let (popped_id, mut def) = self.graph.pop_last().expect("component root def");
         // Hard invariant (release too): a component root's def is always the last graph insert
         // during its own body lowering (children insert first). If future lowering (allOf/union
@@ -510,7 +542,75 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         // yield an identical `Ty` (it matches what the body lowering computed).
         ty.nullable = nullable;
         self.components.insert(name.to_owned(), (root_id, nullable));
+        self.finish_component_aliases(root_id);
         Some(ty)
+    }
+
+    fn finish_component_aliases(&mut self, target: TypeId) {
+        let mut completed = vec![target];
+        while let Some(target) = completed.pop() {
+            let Some(aliases) = self.pending_aliases.remove(&target) else {
+                continue;
+            };
+            let kind = self
+                .graph
+                .get(target)
+                .expect("completed alias target")
+                .kind
+                .clone();
+            for (name, root_id, nullable) in aliases {
+                let RefOr::Item(schema) = &self.document.components.schemas[&name] else {
+                    unreachable!("only annotated schema components defer their body");
+                };
+                let ty = self.insert_schema_type(schema, &name, kind.clone());
+                let (id, mut definition) = self.graph.pop_last().expect("alias definition");
+                assert_eq!(id, ty.id);
+                if let Some(raw) = &schema.default {
+                    let note = format!(
+                        "Default: `{}`.",
+                        default_display_for(raw, Some(&definition.kind))
+                    );
+                    append_doc_note(&mut definition.docs, note);
+                }
+                self.graph.fill(root_id, definition);
+                self.in_progress.remove(&name);
+                self.components.insert(name, (root_id, nullable));
+                completed.push(root_id);
+            }
+        }
+    }
+
+    // A reference alias inherits its target's nullability, including while its
+    // body is still in progress. Resolve the alias chain without lowering types
+    // so recursive fields see the correct nullable flag on the reserved root.
+    fn reference_alias_nullability(&mut self, schema: &Schema) -> Option<bool> {
+        let mut current = std::borrow::Cow::Borrowed(schema);
+        let mut visited = HashSet::new();
+        while schema_is_reference_alias(&current) {
+            let reference = current.reference.as_ref()?;
+            let key = (
+                current.provenance.span.map(|span| span.file),
+                reference.clone(),
+            );
+            if !visited.insert(key) {
+                Diagnostic::error(Code::UnresolvedRef, schema.provenance.clone())
+                    .message("schema component aliases form a reference cycle")
+                    .emit(self.diags);
+                return None;
+            }
+            if visited.len() > MAX_SCHEMA_DEPTH as usize {
+                Diagnostic::error(Code::SchemaNestingTooDeep, schema.provenance.clone())
+                    .message("schema component alias chain exceeds the maximum lowering depth")
+                    .emit(self.diags);
+                return None;
+            }
+            current = self
+                .resolver
+                .resolve(reference, &current.provenance, self.diags)
+                .ok()?
+                .schema;
+        }
+        Some(schema_is_nullable(&current))
     }
 
     /// Lower a remote (`http`/`https`) `$ref` to a shared, cycle-safe type — the remote analogue of
@@ -578,6 +678,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         ty.nullable = nullable;
         self.remote_components
             .insert(reference.to_owned(), (root_id, nullable));
+        self.finish_component_aliases(root_id);
         Some(ty)
     }
 
@@ -4621,6 +4722,15 @@ fn schema_has_shape_constraint(schema: &Schema) -> bool {
         || schema.format.as_deref() == Some("binary")
         || schema.reference.is_some()
         || !schema.all_of.is_empty()
+}
+
+fn schema_is_reference_alias(schema: &Schema) -> bool {
+    if schema.reference.is_none() {
+        return false;
+    }
+    let mut sibling = schema.clone();
+    sibling.reference = None;
+    !schema_has_shape_constraint(&sibling)
 }
 
 /// The provenance of an `allOf` member for diagnostics — the schema's own provenance, or the

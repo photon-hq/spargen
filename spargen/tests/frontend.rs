@@ -152,6 +152,192 @@ components:
     assert!(code.contains("pub extra"), "{code}");
 }
 
+// Annotated component references must not pop/move their shared target's definition.
+// Both component orders matter: one used to panic, the other silently reused its ID.
+fn annotated_reference_spec(components: &str) -> String {
+    format!(
+        r##"
+openapi: 3.1.0
+info: {{ title: Annotated references, version: 1.0.0 }}
+paths:
+  /timestamp:
+    get:
+      operationId: getTimestamp
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json: {{ schema: {{ $ref: '#/components/schemas/Timestamp' }} }}
+  /updated:
+    get:
+      operationId: getUpdated
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json: {{ schema: {{ $ref: '#/components/schemas/UpdatedAt' }} }}
+components:
+  schemas:
+{components}
+"##
+    )
+}
+
+#[test]
+fn annotated_component_reference_to_existing_target_preserves_docs_and_types() {
+    let spec = annotated_reference_spec(
+        r##"    Timestamp: { type: string, format: date-time }
+    UpdatedAt:
+      $ref: '#/components/schemas/Timestamp'
+      description: When this resource was last updated.
+"##,
+    );
+    assert_eq!(check(&spec).outcome, Outcome::Clean);
+    let (report, code) = generate_with_code(&spec);
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(code.contains("pub type Timestamp = DateTime;"), "{code}");
+    assert!(code.contains("pub type UpdatedAt = DateTime;"), "{code}");
+    assert!(
+        code.contains("When this resource was last updated."),
+        "{code}"
+    );
+    assert!(code.contains("ResponseValue<types::Timestamp>"), "{code}");
+    assert!(code.contains("ResponseValue<types::UpdatedAt>"), "{code}");
+}
+
+#[test]
+fn annotated_component_reference_to_new_target_does_not_reuse_its_id() {
+    let spec = annotated_reference_spec(
+        r##"    UpdatedAt:
+      $ref: '#/components/schemas/Timestamp'
+      description: When this resource was last updated.
+    Timestamp: { type: string, format: date-time }
+    Unrelated: { type: object, additionalProperties: false }
+"##,
+    );
+    assert_eq!(check(&spec).outcome, Outcome::Clean);
+    let (report, code) = generate_with_code(&spec);
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(code.contains("pub type Timestamp = DateTime;"), "{code}");
+    assert!(code.contains("ResponseValue<types::Timestamp>"), "{code}");
+    assert!(code.contains("ResponseValue<types::UpdatedAt>"), "{code}");
+    assert!(!code.contains("ResponseValue<types::Unrelated>"), "{code}");
+}
+
+#[test]
+fn annotated_component_reference_preserves_target_nullability() {
+    let spec = annotated_reference_spec(
+        r##"    Timestamp: { type: [string, 'null'], format: date-time }
+    UpdatedAt:
+      $ref: '#/components/schemas/Timestamp'
+      description: A nullable update timestamp.
+"##,
+    );
+    let (report, code) = generate_with_code(&spec);
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(
+        code.contains("ResponseValue<Option<types::Timestamp>>"),
+        "{code}"
+    );
+    assert!(
+        code.contains("ResponseValue<Option<types::UpdatedAt>>"),
+        "{code}"
+    );
+}
+
+#[test]
+fn annotated_component_reference_preserves_nullable_recursive_edges() {
+    let spec = r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths: {}
+components:
+  schemas:
+    Alias:
+      $ref: '#/components/schemas/Node'
+      description: A nullable linked list.
+    Node:
+      type: [object, 'null']
+      properties:
+        next: { $ref: '#/components/schemas/Alias' }
+      required: [next]
+"##;
+    let (report, code) = generate_with_code(spec);
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(code.contains("pub next: Option<Box<Alias>>"), "{code}");
+}
+
+#[test]
+fn annotated_component_reference_to_in_progress_target_stays_typed() {
+    let spec = r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths: {}
+components:
+  schemas:
+    Node:
+      type: [object, 'null']
+      properties:
+        next: { $ref: '#/components/schemas/Alias' }
+      required: [next]
+    Alias:
+      $ref: '#/components/schemas/Node'
+      description: A nullable linked list.
+"##;
+    assert_eq!(check(spec).outcome, Outcome::Clean);
+    let (report, code) = generate_with_code(spec);
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(code.contains("pub struct Alias"), "{code}");
+    assert!(code.contains("pub struct Node"), "{code}");
+    assert!(code.contains("pub next: Option<Box<Alias>>"), "{code}");
+}
+
+#[test]
+fn annotated_component_reference_cycles_are_rejected() {
+    for components in [
+        r##"    A: { $ref: '#/components/schemas/A', description: self }
+"##,
+        r##"    A: { $ref: '#/components/schemas/B', description: first }
+    B: { $ref: '#/components/schemas/A', description: second }
+"##,
+    ] {
+        let spec = format!(
+            "openapi: 3.1.0\ninfo: {{ title: T, version: 1.0.0 }}\npaths: {{}}\ncomponents:\n  schemas:\n{components}"
+        );
+        for report in [check(&spec), generate(&spec)] {
+            assert_eq!(report.outcome, Outcome::Rejected, "{report:#?}");
+            assert!(has_code(&report, Code::UnresolvedRef), "{report:#?}");
+        }
+    }
+}
+
+#[test]
+fn annotated_component_reference_to_recursive_object_stays_typed() {
+    let spec = r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths: {}
+components:
+  schemas:
+    Alias:
+      $ref: '#/components/schemas/Node'
+      description: A linked list.
+    Node:
+      type: object
+      properties:
+        value: { type: string }
+        next: { $ref: '#/components/schemas/Alias' }
+      required: [value]
+"##;
+    assert_eq!(check(spec).outcome, Outcome::Clean);
+    let (report, code) = generate_with_code(spec);
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(code.contains("pub struct Alias"), "{code}");
+    assert!(code.contains("pub struct Node"), "{code}");
+    assert!(code.contains("Option<Box<Alias>>"), "{code}");
+    assert!(code.contains("pub value: Nodevalue"), "{code}");
+}
+
 #[test]
 fn schema_component_alias_chains_resolve_and_cycles_reject() {
     let valid = r##"
