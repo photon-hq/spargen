@@ -8,6 +8,11 @@ Unsupported constructs fail loudly — a diagnostic and no output — rather tha
 to `serde_json::Value`. Where a construct maps to an untyped value, the input schema itself was
 untyped; degradation is never silent.
 
+Named schema references with annotation siblings (for example `$ref` plus `description`) retain
+both the shared target and the annotated component's own type and documentation. References to
+nullable targets remain nullable, including recursive edges. Alias-only cycles with no concrete
+schema are rejected as `E004`; they do not produce untyped placeholder models.
+
 | Area | Supported | Warned | Rejected |
 | --- | --- | --- | --- |
 | Version | OpenAPI `3.1.x` and `3.2.x`; version-specific required fields are enforced by the corresponding official schema | - | OpenAPI `3.0.x`/`<3.1`/`3.3+`/other or malformed versions (`E001`) |
