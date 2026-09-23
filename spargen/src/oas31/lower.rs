@@ -2497,7 +2497,8 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
     }
 
     fn lower_request_body(&mut self, body: &RequestBodyObject) -> Option<RequestBody> {
-        let (media_name, object) = choose_media(&body.content, &body.provenance, self.diags)?;
+        let (media_name, object) =
+            choose_media(&body.content, &body.provenance, self.diags, false)?;
         let object = self.resolve_media_object(object)?;
         let media = lower_media_type(media_name, &body.provenance, self.diags)?;
         // Streaming media is a response-only construct: a `text/event-stream` / `application/x-ndjson`
@@ -2997,16 +2998,21 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
     }
 
     fn lower_response(&mut self, response: &ResponseObject) -> Option<Response> {
-        let body = choose_media(&response.content, &response.provenance, self.diags).and_then(
+        let body = choose_media(&response.content, &response.provenance, self.diags, true).and_then(
             |(media_name, object)| {
                 let object = self.resolve_media_object(object)?;
-                let media = lower_media_type(media_name, &response.provenance, self.diags)?;
+                let wildcard = media_essence(media_name) == "*/*";
+                let media = if wildcard {
+                    MediaType::OctetStream
+                } else {
+                    lower_media_type(media_name, &response.provenance, self.diags)?
+                };
                 // For a sequential/streaming media (`text/event-stream` / `application/x-ndjson`),
                 // OpenAPI 3.2 gives the PER-ITEM type in `itemSchema`; a whole-body `schema` does not
                 // apply to a stream, so `itemSchema` is preferred (falling back to `schema` for the
                 // pre-3.2 form where the item type was written as `schema`). On a non-streaming media
                 // `itemSchema` is meaningless: acknowledge it with `W010` and use `schema`.
-                let (ty, stream) = if let Some(framing) = media.stream_framing() {
+                let (mut ty, stream) = if let Some(framing) = media.stream_framing() {
                     if let Some(item_schema) = object.item_schema.as_ref() {
                         if media == MediaType::EventStream && self.document.is_oas32 {
                             if let Some(json) = super::sse::json_data_schema(
@@ -3074,6 +3080,14 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                     self.warn_structural_default_ref(schema, "a response body schema");
                 } else if let Some(schema) = object.schema.as_ref() {
                     self.warn_structural_default_ref(schema, "a response body schema");
+                }
+                // OAS 3.1 raw files can use an unconstrained schema (or omit it).
+                // Allocate a response-local byte type; a shared unconstrained component
+                // must retain its JSON meaning when referenced by other operations.
+                if wildcard && (object.schema.is_none() || ty.is_some_and(|ty| {
+                    matches!(self.graph.get(ty.id).map(|def| &def.kind), Some(TypeKind::Any))
+                })) {
+                    ty = Some(self.insert_type("ResponseBytes", TypeKind::Bytes, Docs::default(), None));
                 }
                 if matches!(media, MediaType::FormUrlEncoded | MediaType::Multipart) {
                     Diagnostic::error(Code::UnsupportedMediaType, response.provenance.clone())
@@ -4260,13 +4274,19 @@ fn choose_media<'a, T>(
     content: &'a IndexMap<String, T>,
     provenance: &crate::diag::Provenance,
     diags: &mut Diagnostics,
+    allow_wildcard: bool,
 ) -> Option<(&'a str, &'a T)> {
     if content.is_empty() {
         return None;
     }
     let mut selected: Option<(u8, usize, &str, &T)> = None;
     for (source_index, (media, value)) in content.iter().enumerate() {
-        let Some((_, rank)) = classify_media(media_essence(media)) else {
+        let rank = if allow_wildcard && media_essence(media) == "*/*" {
+            // Prefer a concrete representation whenever one is supported.
+            u8::MAX
+        } else if let Some((_, rank)) = classify_media(media_essence(media)) {
+            rank
+        } else {
             continue;
         };
         let candidate = (rank, source_index, media.as_str(), value);

@@ -2137,6 +2137,60 @@ paths:
 }
 
 #[test]
+fn wildcard_response_with_unconstrained_schema_preserves_raw_bytes() {
+    for schema in [
+        "{}",
+        "true",
+        "{ $ref: '#/components/schemas/Raw' }",
+        "{ type: string, format: binary }",
+    ] {
+        let spec = format!(
+            r##"
+openapi: 3.1.0
+info: {{ title: T, version: 1.0.0 }}
+paths:
+  /download:
+    get:
+      responses:
+        "200":
+          description: raw file bytes
+          content:
+            '*/*':
+              schema: {schema}
+components:
+  schemas:
+    Raw: {{}}
+"##
+        );
+        for report in [generate(&spec), check(&spec)] {
+            assert_ne!(report.outcome, Outcome::Rejected, "{report:#?}");
+            assert!(!has_code(&report, Code::UnsupportedMediaType));
+        }
+    }
+}
+
+#[test]
+fn wildcard_response_does_not_discard_a_typed_schema() {
+    let spec = r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /download:
+    get:
+      responses:
+        "200":
+          description: typed payload
+          content:
+            '*/*':
+              schema: { type: object, properties: { value: { type: string } } }
+"##;
+    for report in [generate(spec), check(spec)] {
+        assert_eq!(report.outcome, Outcome::Rejected, "{report:#?}");
+        assert!(has_code(&report, Code::UnsupportedMediaType));
+    }
+}
+
+#[test]
 fn e009_request_only_media_is_rejected_in_responses() {
     let report = generate(
         r##"

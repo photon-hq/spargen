@@ -68,11 +68,10 @@ serde = {{ version = "1.0.229", features = ["derive"] }}
 serde_json = "1.0.151"
 
 [build-dependencies]
-spargen = {{ path = {:?}, default-features = false }}
+spargen = {{ path = {spargen_path:?}, default-features = false }}
 
 [workspace]
-"#,
-            spargen_path
+"#
         ),
     )
     .unwrap();
@@ -620,6 +619,33 @@ fn textual_vendor_and_binary_responses_use_raw_wire_codecs() {
     let (base, server) = serve_once("application/octet-stream", "200 OK", b"\0raw\xff");
     let client = basic_client::BlockingClient::new(&base).unwrap();
     assert_eq!(client.download_raw().unwrap().into_inner().as_ref(), b"\0raw\xff");
+    server.join().unwrap();
+}
+
+#[test]
+fn wildcard_files_preserve_bytes_for_binary_text_and_json_content_types() {
+    for (media, body) in [
+        ("image/png", b"\0raw\xff".as_slice()),
+        ("text/plain", b"raw file".as_slice()),
+        ("application/json", b"{ \"file\": true }\n".as_slice()),
+        ("application/octet-stream", b"".as_slice()),
+    ] {
+        let (base, server) = serve_once(media, "200 OK", body);
+        let client = basic_client::BlockingClient::new(&base).unwrap();
+        assert_eq!(client.download_wildcard().unwrap().into_inner().as_ref(), body);
+        server.join().unwrap();
+    }
+    let (base, server) = serve_once("image/png", "200 OK", b"\0raw\xff");
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    assert_eq!(client.download_without_schema().unwrap().into_inner().as_ref(), b"\0raw\xff");
+    server.join().unwrap();
+
+    let (base, server) = serve_once("application/json", "404 Not Found", b"\"missing\"");
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    match client.download_wildcard().unwrap_err() {
+        basic_client::Error::Api(response) => assert_eq!(response.into_inner(), "missing"),
+        other => panic!("expected documented JSON error, got {other:?}"),
+    }
     server.join().unwrap();
 }
 
@@ -1987,6 +2013,28 @@ paths:
           content:
             application/octet-stream:
               schema: { type: string, format: binary }
+  /wildcard-download:
+    get:
+      operationId: downloadWildcard
+      responses:
+        "200":
+          description: a raw file of any media type
+          content:
+            '*/*':
+              schema: { $ref: '#/components/schemas/UnconstrainedFile' }
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { type: string }
+  /wildcard-no-schema:
+    get:
+      operationId: downloadWithoutSchema
+      responses:
+        "200":
+          description: a raw file without a schema
+          content:
+            '*/*': {}
   /text-error:
     get:
       operationId: getTextError
@@ -2193,6 +2241,7 @@ components:
       in: header
       name: X-Api-Key
   schemas:
+    UnconstrainedFile: {}
     # A flat object, so `deepObject` is defined for it (the specification leaves nested objects
     # and arrays inside a deepObject value undefined, and spargen rejects those).
     DeepFilter:
