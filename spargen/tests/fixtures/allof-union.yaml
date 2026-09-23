@@ -1,0 +1,65 @@
+openapi: 3.1.0
+info: { title: Union intersections, version: 1.0.0 }
+paths: {}
+components:
+  schemas:
+    EncodedPayload:
+      type: object
+      required: [rawRequestBase64]
+      properties:
+        rawRequestBase64: { type: string, contentEncoding: base64 }
+    Sms:
+      type: object
+      required: [platform, text]
+      properties:
+        platform: { type: string, const: sms }
+        text: { type: string }
+    Email:
+      type: object
+      required: [platform, subject]
+      properties:
+        platform: { type: string, const: email }
+        subject: { type: string }
+    Message:
+      oneOf:
+        - $ref: '#/components/schemas/Sms'
+        - $ref: '#/components/schemas/Email'
+    Received:
+      allOf:
+        - $ref: '#/components/schemas/Message'
+        - type: object
+          required: [status]
+          properties:
+            status: { type: string, const: received }
+    SmsReceived:
+      allOf:
+        - type: object
+          required: [platform]
+          properties:
+            platform: { type: string, const: sms }
+        - $ref: '#/components/schemas/Received'
+    Inline:
+      allOf:
+        - anyOf:
+            - $ref: '#/components/schemas/Sms'
+            - $ref: '#/components/schemas/Email'
+            - type: string
+        - type: object
+          required: [status]
+          properties:
+            status: { type: string, const: received }
+    Overlapping:
+      oneOf:
+        - $ref: '#/components/schemas/Sms'
+        - type: object
+          required: [platform, text]
+          properties:
+            platform: { type: string, const: sms }
+            text: { type: string, enum: [special] }
+    OverlappingReceived:
+      allOf:
+        - $ref: '#/components/schemas/Overlapping'
+        - type: object
+          required: [status]
+          properties:
+            status: { type: string, const: received }

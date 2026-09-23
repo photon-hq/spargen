@@ -116,7 +116,7 @@ pub enum TypeKind {
     Array(Box<Ty>),
     /// A fixed-length heterogeneous tuple (`prefixItems`).
     Tuple(Vec<Ty>),
-    /// Raw bytes (`octet-stream` / `contentEncoding: base64`).
+    /// Raw bytes (`octet-stream` / `format: binary`).
     Bytes,
     /// The exact JSON `null` value (emitted as Rust's unit type, whose serde form is `null`).
     Null,
