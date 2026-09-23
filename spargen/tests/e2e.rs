@@ -68,11 +68,10 @@ serde = {{ version = "1.0.229", features = ["derive"] }}
 serde_json = "1.0.151"
 
 [build-dependencies]
-spargen = {{ path = {:?}, default-features = false }}
+spargen = {{ path = {spargen_path:?}, default-features = false }}
 
 [workspace]
-"#,
-            spargen_path
+"#
         ),
     )
     .unwrap();
@@ -204,6 +203,65 @@ fn runtime_dependency_floors_compile_with_direct_minimal_versions() {
         assert!(
             status.success(),
             "the declared runtime floors must compile for wasm"
+        );
+    }
+}
+
+#[test]
+fn all_of_union_intersections_compile_and_round_trip() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(&spec, include_str!("fixtures/allof-union.yaml")).unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "allof_union_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    let path = out.join("src/lib.rs");
+    let mut code = std::fs::read_to_string(&path).unwrap();
+    code.push_str(include_str!("fixtures/allof-union-runtime.rs"));
+    std::fs::write(path, code).unwrap();
+    for args in [
+        vec!["test"],
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"],
+    ] {
+        let output = Command::new("cargo")
+            .args(args)
+            .current_dir(&out)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn annotated_component_references_compile_and_round_trip() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(&spec, include_str!("fixtures/annotated-references.yaml")).unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "annotated_reference_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    let path = out.join("src/lib.rs");
+    let mut code = std::fs::read_to_string(&path).unwrap();
+    code.push_str(include_str!("fixtures/annotated-references-runtime.rs"));
+    std::fs::write(path, code).unwrap();
+    for args in [
+        vec!["test"],
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"],
+    ] {
+        let output = Command::new("cargo")
+            .args(args)
+            .current_dir(&out)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
@@ -620,6 +678,34 @@ fn textual_vendor_and_binary_responses_use_raw_wire_codecs() {
     let (base, server) = serve_once("application/octet-stream", "200 OK", b"\0raw\xff");
     let client = basic_client::BlockingClient::new(&base).unwrap();
     assert_eq!(client.download_raw().unwrap().into_inner().as_ref(), b"\0raw\xff");
+    server.join().unwrap();
+}
+
+/// Wildcard fallback preserves wire bytes despite form alternatives and varying Content-Types.
+#[test]
+fn wildcard_files_preserve_bytes_for_binary_text_and_json_content_types() {
+    for (media, body) in [
+        ("image/png", b"\0raw\xff".as_slice()),
+        ("text/plain", b"raw file".as_slice()),
+        ("application/json", b"{ \"file\": true }\n".as_slice()),
+        ("application/octet-stream", b"".as_slice()),
+    ] {
+        let (base, server) = serve_once(media, "200 OK", body);
+        let client = basic_client::BlockingClient::new(&base).unwrap();
+        assert_eq!(client.download_wildcard().unwrap().into_inner().as_ref(), body);
+        server.join().unwrap();
+    }
+    let (base, server) = serve_once("image/png", "200 OK", b"\0raw\xff");
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    assert_eq!(client.download_without_schema().unwrap().into_inner().as_ref(), b"\0raw\xff");
+    server.join().unwrap();
+
+    let (base, server) = serve_once("application/json", "404 Not Found", b"\"missing\"");
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    match client.download_wildcard().unwrap_err() {
+        basic_client::Error::Api(response) => assert_eq!(response.into_inner(), "missing"),
+        other => panic!("expected documented JSON error, got {other:?}"),
+    }
     server.join().unwrap();
 }
 
@@ -1987,6 +2073,32 @@ paths:
           content:
             application/octet-stream:
               schema: { type: string, format: binary }
+  /wildcard-download:
+    get:
+      operationId: downloadWildcard
+      responses:
+        "200":
+          description: a raw file of any media type
+          content:
+            application/x-www-form-urlencoded:
+              schema: { type: object }
+            multipart/form-data:
+              schema: { type: object }
+            '*/*':
+              schema: { $ref: '#/components/schemas/UnconstrainedFile' }
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { type: string }
+  /wildcard-no-schema:
+    get:
+      operationId: downloadWithoutSchema
+      responses:
+        "200":
+          description: a raw file without a schema
+          content:
+            '*/*': {}
   /text-error:
     get:
       operationId: getTextError
@@ -2193,6 +2305,7 @@ components:
       in: header
       name: X-Api-Key
   schemas:
+    UnconstrainedFile: {}
     # A flat object, so `deepObject` is defined for it (the specification leaves nested objects
     # and arrays inside a deepObject value undefined, and spargen rejects those).
     DeepFilter:

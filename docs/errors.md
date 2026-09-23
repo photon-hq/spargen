@@ -37,3 +37,7 @@ the library API.
 | `W012` | Warning | runtime-dependency audit skipped |
 | `W013` | Warning | cargo integration degraded |
 | `W014` | Warning | alternative media type not generated |
+
+`E009` also rejects typed wildcard response schemas: response-only `*/*` supports
+raw bytes with an absent, unconstrained, or binary schema. Wildcard requests remain
+unsupported because they do not determine a concrete request Content-Type.
