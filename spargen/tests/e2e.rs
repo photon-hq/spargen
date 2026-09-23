@@ -681,6 +681,7 @@ fn textual_vendor_and_binary_responses_use_raw_wire_codecs() {
     server.join().unwrap();
 }
 
+/// Wildcard fallback preserves wire bytes despite form alternatives and varying Content-Types.
 #[test]
 fn wildcard_files_preserve_bytes_for_binary_text_and_json_content_types() {
     for (media, body) in [
@@ -2079,6 +2080,10 @@ paths:
         "200":
           description: a raw file of any media type
           content:
+            application/x-www-form-urlencoded:
+              schema: { type: object }
+            multipart/form-data:
+              schema: { type: object }
             '*/*':
               schema: { $ref: '#/components/schemas/UnconstrainedFile' }
         "404":

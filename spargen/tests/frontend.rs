@@ -2322,6 +2322,7 @@ paths:
     assert!(has_code(&related, Code::UnsupportedMediaType));
 }
 
+/// Unconstrained and binary schemas are valid inputs for raw wildcard responses.
 #[test]
 fn wildcard_response_with_unconstrained_schema_preserves_raw_bytes() {
     for schema in [
@@ -2355,6 +2356,89 @@ components:
     }
 }
 
+/// Request-only form codecs must not hide the raw-byte fallback, in either source order.
+#[test]
+fn wildcard_response_skips_request_only_media() {
+    for media in ["application/x-www-form-urlencoded", "multipart/form-data"] {
+        let form = format!("            '{media}':\n              schema: {{ type: object }}\n");
+        let wildcard = "            '*/*':\n              schema: {}\n";
+        for content in [format!("{form}{wildcard}"), format!("{wildcard}{form}")] {
+            let spec = format!(
+                r#"
+openapi: 3.1.0
+info: {{ title: T, version: 1.0.0 }}
+paths:
+  /download:
+    get:
+      responses:
+        "200":
+          description: raw file bytes
+          content:
+{content}
+"#
+            );
+            for report in [generate(&spec), check(&spec)] {
+                assert_ne!(report.outcome, Outcome::Rejected, "{media}: {report:#?}");
+                assert!(
+                    !has_code(&report, Code::UnsupportedMediaType),
+                    "{report:#?}"
+                );
+                assert!(
+                    report.diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == Code::AlternativeMediaIgnored
+                            && diagnostic.message.starts_with("`*/*` is generated;")
+                    }),
+                    "{report:#?}"
+                );
+            }
+        }
+    }
+}
+
+/// Supported concrete response codecs keep priority over a wildcard declared first.
+#[test]
+fn wildcard_response_prefers_supported_concrete_media() {
+    for (media, schema) in [
+        ("application/json", "{ type: object }"),
+        ("text/plain", "{ type: string }"),
+        (
+            "application/octet-stream",
+            "{ type: string, format: binary }",
+        ),
+    ] {
+        let spec = format!(
+            r#"
+openapi: 3.1.0
+info: {{ title: T, version: 1.0.0 }}
+paths:
+  /download:
+    get:
+      responses:
+        "200":
+          description: concrete response with wildcard fallback
+          content:
+            '*/*':
+              schema: {{}}
+            '{media}':
+              schema: {schema}
+"#
+        );
+        for report in [generate(&spec), check(&spec)] {
+            assert_ne!(report.outcome, Outcome::Rejected, "{media}: {report:#?}");
+            assert!(
+                report.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == Code::AlternativeMediaIgnored
+                        && diagnostic
+                            .message
+                            .starts_with(&format!("`{media}` is generated;"))
+                }),
+                "{report:#?}"
+            );
+        }
+    }
+}
+
+/// A wildcard must not erase the meaning of a typed response schema.
 #[test]
 fn wildcard_response_does_not_discard_a_typed_schema() {
     let spec = r##"
@@ -2376,12 +2460,14 @@ paths:
     }
 }
 
+/// Without a supported alternative, either form response still fails with E009.
 #[test]
 fn e009_request_only_media_is_rejected_in_responses() {
-    let report = generate(
-        r##"
+    for media in ["application/x-www-form-urlencoded", "multipart/form-data"] {
+        let spec = format!(
+            r#"
 openapi: 3.1.0
-info: { title: T, version: 1.0.0 }
+info: {{ title: T, version: 1.0.0 }}
 paths:
   /x:
     get:
@@ -2389,12 +2475,15 @@ paths:
         "200":
           description: unsupported response codec
           content:
-            application/x-www-form-urlencoded:
-              schema: { type: object }
-"##,
-    );
-    assert_eq!(report.outcome, Outcome::Rejected, "{report:#?}");
-    assert!(has_code(&report, Code::UnsupportedMediaType));
+            '{media}':
+              schema: {{ type: object }}
+"#
+        );
+        for report in [generate(&spec), check(&spec)] {
+            assert_eq!(report.outcome, Outcome::Rejected, "{report:#?}");
+            assert!(has_code(&report, Code::UnsupportedMediaType));
+        }
+    }
 }
 
 #[test]

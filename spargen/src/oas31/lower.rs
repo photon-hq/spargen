@@ -2609,6 +2609,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         })
     }
 
+    /// Lower the preferred request body and validate its schema and encoding for that codec.
     fn lower_request_body(&mut self, body: &RequestBodyObject) -> Option<RequestBody> {
         let (media_name, object) =
             choose_media(&body.content, &body.provenance, self.diags, false)?;
@@ -3110,6 +3111,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         Responses { by_status, default }
     }
 
+    /// Lower the preferred response representation and headers, preserving raw file bytes.
     fn lower_response(&mut self, response: &ResponseObject) -> Option<Response> {
         let body = choose_media(&response.content, &response.provenance, self.diags, true).and_then(
             |(media_name, object)| {
@@ -4383,21 +4385,26 @@ fn lower_media_type(
     }
 }
 
+/// Select one supported representation and warn about alternatives. Responses exclude request-only
+/// form codecs and may fall back to `*/*`; requests retain their concrete media preferences.
 fn choose_media<'a, T>(
     content: &'a IndexMap<String, T>,
     provenance: &crate::diag::Provenance,
     diags: &mut Diagnostics,
-    allow_wildcard: bool,
+    is_response: bool,
 ) -> Option<(&'a str, &'a T)> {
     if content.is_empty() {
         return None;
     }
     let mut selected: Option<(u8, usize, &str, &T)> = None;
     for (source_index, (media, value)) in content.iter().enumerate() {
-        let rank = if allow_wildcard && media_essence(media) == "*/*" {
+        let rank = if is_response && media_essence(media) == "*/*" {
             // Prefer a concrete representation whenever one is supported.
             u8::MAX
-        } else if let Some((_, rank)) = classify_media(media_essence(media)) {
+        } else if let Some((kind, rank)) = classify_media(media_essence(media)) {
+            if is_response && matches!(kind, MediaType::FormUrlEncoded | MediaType::Multipart) {
+                continue;
+            }
             rank
         } else {
             continue;
