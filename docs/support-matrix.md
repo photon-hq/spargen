@@ -32,3 +32,18 @@ schema are rejected as `E004`; they do not produce untyped placeholder models.
 Generated output is freestanding Rust with embedded support code and no `spargen` runtime
 dependency. It compiles for native targets and `wasm32-unknown-unknown` (browser `fetch`); see the
 **Targets** row for wasm limitations (no blocking client, non-incremental streaming).
+
+### Request field presence
+
+In models reachable from a selected request body, optional nullable fields use
+`Option<Option<T>>`: `None` omits the property, `Some(None)` serializes JSON `null`, and
+`Some(Some(value))` serializes the value. Optional non-nullable fields remain `Option<T>`;
+required nullable fields remain `Option<T>` but must be present when deserializing. Required
+non-nullable fields remain `T`. Null is rejected when the field's schema does not permit it.
+Existing scalar default behavior is unchanged.
+
+This applies through referenced/nested models, arrays, tuples, map values and unions, including
+models shared by requests and responses. Response-only models keep their existing representation.
+Regenerating changes the Rust construction API of optional nullable request fields from `Some(v)`
+to `Some(Some(v))`; use `Some(None)` to clear a JSON field. Multipart continues to omit null parts,
+as it has no generic JSON-null part representation; this change does not define a new form encoding.

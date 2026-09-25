@@ -208,6 +208,44 @@ fn runtime_dependency_floors_compile_with_direct_minimal_versions() {
 }
 
 #[test]
+fn request_field_presence_compiles_and_round_trips() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(&spec, include_str!("fixtures/request-presence.yaml")).unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "request_presence_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    let path = out.join("src/lib.rs");
+    let mut code = std::fs::read_to_string(&path).unwrap();
+    let repeat = temp.path().join("repeat.rs");
+    let report = spargen::generate(
+        &Spec::new(Utf8PathBuf::from_path_buf(spec).unwrap())
+            .build(Utf8PathBuf::from_path_buf(repeat.clone()).unwrap())
+            .cargo(CargoIntegration::Off),
+    );
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert_eq!(code, std::fs::read_to_string(repeat).unwrap());
+    code.push_str(include_str!("fixtures/request-presence-runtime.rs"));
+    std::fs::write(path, code).unwrap();
+    for args in [
+        vec!["test"],
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"],
+    ] {
+        let output = Command::new("cargo")
+            .args(args)
+            .current_dir(&out)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn all_of_union_intersections_compile_and_round_trip() {
     let temp = tempfile::tempdir().unwrap();
     let spec = temp.path().join("openapi.yaml");

@@ -3,11 +3,12 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use std::collections::BTreeSet;
 
 use crate::ir::{
     AdditionalProps, Api, ApiKeyLoc, DisjointFeature, ErrorShape, Field, HttpScheme, JsonCategory,
     MediaType, Operation, ParamLoc, Prim, ScalarRepr, ScalarValue, SecurityScheme, SuccessShape,
-    Ty, TypeDef, TypeKind, UnionMode, UnionStrategy,
+    Ty, TypeDef, TypeId, TypeKind, UnionMode, UnionStrategy,
 };
 use crate::name::{Names, OperationBindings};
 
@@ -15,10 +16,24 @@ use super::CodegenOptions;
 
 /// Emit the `types` (models) module for every type in the graph, in deterministic order.
 pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) -> TokenStream {
+    let requests = request_model_types(api);
     let items = api
         .types
         .iter()
-        .map(|(id, def)| emit_type_def(id, def, api, names, options));
+        .map(|(id, def)| emit_type_def(id, def, api, names, options, requests.contains(&id)));
+    let presence_helper = (!requests.is_empty()).then(|| {
+        quote! {
+            // Serde's field default handles absence. For a present field, deserialize its actual
+            // schema type first, preserving null only when that type permits it.
+            fn deserialize_request_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+                T: Deserialize<'de>,
+            {
+                T::deserialize(deserializer).map(Some)
+            }
+        }
+    });
     // The RFC 3339 newtypes live beside `types`, so bring them into scope under the same bare names
     // `prim_tokens` emits; at the generated root the prelude re-export supplies them instead.
     let datetime_import = (options.feature_time && api.uses_time()).then(|| {
@@ -31,10 +46,42 @@ pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) ->
             use serde::{Deserialize, Serialize};
             use std::collections::BTreeMap;
             #datetime_import
+            #presence_helper
 
             #(#items)*
         }
     }
+}
+
+/// Follow the selected request bodies through references, containers and unions once. Shared
+/// request/response models keep one identity; response-only models retain their existing API.
+fn request_model_types(api: &Api) -> BTreeSet<TypeId> {
+    let mut pending: Vec<_> = api
+        .operations
+        .iter()
+        .filter_map(|operation| operation.request_body.as_ref()?.ty.map(|ty| ty.id))
+        .collect();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match api.types.get(id).map(|def| &def.kind) {
+            Some(TypeKind::Struct(object)) => {
+                pending.extend(object.fields.iter().map(|field| field.ty.id));
+                if let AdditionalProps::Typed(ty) = &object.additional {
+                    pending.push(ty.id);
+                }
+            }
+            Some(TypeKind::Array(ty)) => pending.push(ty.id),
+            Some(TypeKind::Tuple(items)) => pending.extend(items.iter().map(|ty| ty.id)),
+            Some(TypeKind::Union(union)) => {
+                pending.extend(union.variants.iter().map(|variant| variant.ty.id));
+            }
+            _ => {}
+        }
+    }
+    seen
 }
 
 /// The declared security schemes, rendered as rustdoc for `with_credential`.
@@ -1494,8 +1541,7 @@ fn emit_multipart_body(
             .fields
             .get(&(ty.id, field.name.wire.clone()))
             .expect("multipart body field name allocated");
-        // A field is accessed as `Option<T>` when it is optional (an extra `Option` wrapper) or the
-        // schema itself is nullable (`ty_tokens` already wrapped it) — mirroring `emit_field`.
+        // Request fields have separate presence and nullability wrappers, mirroring `emit_field`.
         let optional = !field.required || field.ty.nullable;
         let kind = api.types.get(field.ty.id).map(|def| &def.kind);
         let property = encoding
@@ -1593,10 +1639,16 @@ fn emit_multipart_body(
             }
         };
         if optional {
-            // `value` is already `&T` from the `if let Some(value) = &body.field` binding.
+            // Multipart has no generic JSON-null part representation. Keep its existing behavior
+            // of omitting null parts, while accepting the request model's separate presence layer.
+            let value = if !field.required && field.ty.nullable {
+                quote! { #body_binding.#field_ident.as_ref().and_then(Option::as_ref) }
+            } else {
+                quote! { #body_binding.#field_ident.as_ref() }
+            };
             let stmt = add_part(&quote! { value }, &quote! { value });
             quote! {
-                if let Some(value) = &#body_binding.#field_ident {
+                if let Some(value) = #value {
                     #stmt
                 }
             }
@@ -2254,6 +2306,7 @@ fn emit_type_def(
     api: &Api,
     names: &Names,
     options: &CodegenOptions,
+    request_model: bool,
 ) -> TokenStream {
     let ident = names.types.get(&id).expect("type name allocated");
     let docs = doc_tokens(&def.docs);
@@ -2265,7 +2318,7 @@ fn emit_type_def(
             let fields = object
                 .fields
                 .iter()
-                .map(|field| emit_field(id, field, names, options));
+                .map(|field| emit_field(id, field, names, options, request_model));
             let providers = object
                 .fields
                 .iter()
@@ -2738,6 +2791,7 @@ fn emit_field(
     field: &Field,
     names: &Names,
     options: &CodegenOptions,
+    request_model: bool,
 ) -> TokenStream {
     let ident = names
         .fields
@@ -2751,14 +2805,23 @@ fn emit_field(
         .xml
         .wire_override(&field.name.wire)
         .unwrap_or_else(|| field.name.wire.clone());
-    // `ty_tokens` already wraps a nullable type in `Option` (`"null"` in the type array), so only an
-    // *optional* non-nullable field needs the extra `Option` here — wrapping a nullable field again
-    // would yield `Option<Option<T>>`. A required nullable field stays a single `Option<T>` (present
-    // but may be `null`); an optional field of either kind is a single `Option<T>`.
+    // `ty_tokens` represents nullability. In request models an independent outer `Option`
+    // represents absence: None omits the key, Some(None) sends null, Some(Some(value)) sends value.
+    // Keep the existing shape of response-only models.
     let mut ty = ty_tokens(field.ty, names, options, false);
-    if !field.required && !field.ty.nullable {
+    if !field.required && (request_model || !field.ty.nullable) {
         ty = quote! { Option<#ty> };
     }
+    let deserialize = if !request_model || (field.required && !field.ty.nullable) {
+        // Ordinary required types already reject absence. Avoid generating redundant serde
+        // wrappers for those fields; only Option's special missing-field behavior needs overriding.
+        quote! {}
+    } else if field.required {
+        // An explicit deserializer makes serde reject a missing field even when its type is Option.
+        quote! { deserialize_with = "serde::Deserialize::deserialize", }
+    } else {
+        quote! { deserialize_with = "deserialize_request_field", }
+    };
     // An optional field always deserializes an absent value; when the spec gives a representable
     // scalar default, point serde at a generated provider so the default fills in rather than
     // `None`. Otherwise fall back to `Option::default()` (`None`).
@@ -2793,7 +2856,7 @@ fn emit_field(
         .map(|note| quote! { #[doc = #note] });
     quote! {
         #(#notes)*
-        #[serde(rename = #wire, #serde_default)]
+        #[serde(rename = #wire, #serde_default #deserialize)]
         pub #ident: #ty,
     }
 }
