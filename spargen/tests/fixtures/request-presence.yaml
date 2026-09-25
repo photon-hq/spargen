@@ -1,0 +1,94 @@
+openapi: 3.1.0
+info: { title: Request field presence, version: 1.0.0 }
+paths:
+  /change:
+    patch:
+      operationId: change
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Change' }
+      responses:
+        '200':
+          description: The shared request and response model
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Change' }
+  /upload:
+    post:
+      operationId: upload
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: '#/components/schemas/Part' }
+      responses:
+        '204': { description: Uploaded }
+  /response-only:
+    get:
+      operationId: responseOnly
+      responses:
+        '200':
+          description: A model never used in requests
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseOnly' }
+components:
+  schemas:
+    Change:
+      type: object
+      additionalProperties: false
+      required: [requiredValue, requiredNullable]
+      properties:
+        requiredValue: { type: string }
+        requiredNullable: { type: [string, 'null'] }
+        optionalValue: { type: string }
+        optionalNullable: { type: [string, 'null'] }
+        child: { $ref: '#/components/schemas/Child' }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/ArrayChild' }
+        byName:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/MapChild' }
+        choice:
+          oneOf:
+            - { $ref: '#/components/schemas/UnionChild' }
+            - { type: string }
+        recursive: { $ref: '#/components/schemas/Node' }
+        tuple:
+          type: array
+          prefixItems:
+            - { $ref: '#/components/schemas/TupleChild' }
+            - { type: string }
+          items: false
+          minItems: 2
+          maxItems: 2
+        status: { $ref: '#/components/schemas/Status' }
+        defaultValue: { type: integer, default: 7 }
+    Child:
+      type: object
+      additionalProperties: false
+      properties:
+        label: { type: [string, 'null'] }
+    ArrayChild: { $ref: '#/components/schemas/Child' }
+    MapChild: { $ref: '#/components/schemas/Child' }
+    UnionChild: { $ref: '#/components/schemas/Child' }
+    TupleChild: { $ref: '#/components/schemas/Child' }
+    Status: { enum: [draft, ready, null] }
+    Node:
+      type: object
+      additionalProperties: false
+      properties:
+        label: { type: [string, 'null'] }
+        next: { $ref: '#/components/schemas/Node' }
+    Part:
+      type: object
+      properties:
+        label: { type: [string, 'null'] }
+        data: { type: [string, 'null'], format: binary }
+    ResponseOnly:
+      type: object
+      properties:
+        label: { type: [string, 'null'] }
