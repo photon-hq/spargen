@@ -64,7 +64,8 @@ field. An inline string `const` (or single-value string `enum`) used as a struct
 `String` field whose value is checked when it is deserialized and serialized, so it accepts and
 produces exactly the constant; used anywhere else it stays a one-variant enum. A type that lowering
 produced but nothing in the API reaches gets no name and no item. An enum value with no letters or
-digits is named after its symbols (`*` is `Asterisk`, `#` is `Hash`).
+digits is named after its symbols (`*` is `Asterisk`, `#` is `Hash`), and a leading sign is part of
+the name (`-created_at` is `MinusCreatedAt`, `-Infinity` is `MinusInfinity`).
 
 A single server with no variables and no 3.2 `name` generates only `servers::default_url()`; a
 single templated server's builder is `servers::Server`, and several unnamed servers remain

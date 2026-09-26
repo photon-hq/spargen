@@ -29,12 +29,23 @@ pub fn to_snake_case(raw: &str) -> String {
     }
 }
 
-/// The words of `raw`; for a value with no letters or digits at all (an enum value such as `*`
+/// The words of `raw`, led by `minus`/`plus` when `raw` starts with a sign; for a value with no
+/// letters or digits at all (an enum value such as `*`
 /// or `#`), the names of its ASCII symbols instead, so it still gets a distinct, readable name
 /// rather than the shared `Generated` fallback.
 fn words_or_symbols(raw: &str) -> Vec<String> {
-    let found = words(raw);
+    let mut found = words(raw);
     if !found.is_empty() {
+        // A leading sign is meaning, not a separator: `-Infinity` and `Infinity`, or a
+        // descending `-created_at` sort key and `created_at`, must not share a name.
+        let sign = match raw.trim_start().chars().next() {
+            Some('-') => Some("minus"),
+            Some('+') => Some("plus"),
+            _ => None,
+        };
+        if let Some(sign) = sign {
+            found.insert(0, sign.to_owned());
+        }
         return found;
     }
     raw.chars()
@@ -122,7 +133,10 @@ mod tests {
     fn symbol_only_values_are_named_by_their_symbols() {
         assert_eq!(to_pascal_case("*"), "Asterisk");
         assert_eq!(to_pascal_case("#"), "Hash");
-        assert_eq!(to_pascal_case("+1"), "1");
+        assert_eq!(to_pascal_case("+1"), "Plus1");
+        assert_eq!(to_pascal_case("-Infinity"), "MinusInfinity");
+        assert_eq!(to_snake_case("-created_at"), "minus_created_at");
+        assert_eq!(to_pascal_case("in-progress"), "InProgress");
         assert_eq!(to_pascal_case("<="), "LessThanEquals");
         assert_eq!(to_snake_case("-"), "minus");
         // No letters, digits or ASCII symbols: the generic fallback remains.
