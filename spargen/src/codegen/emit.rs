@@ -17,9 +17,12 @@ use super::CodegenOptions;
 /// Emit the `types` (models) module for every type in the graph, in deterministic order.
 pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) -> TokenStream {
     let requests = request_model_types(api);
+    // Only named types get an item. Inline types are spelled out where they are used, and a type
+    // with no name at all is a lowering by-product nothing in the API reaches.
     let items = api
         .types
         .iter()
+        .filter(|(id, _)| names.types.contains_key(id))
         .map(|(id, def)| emit_type_def(id, def, api, names, options, requests.contains(&id)));
     let presence_helper = (!requests.is_empty()).then(|| {
         quote! {
@@ -39,6 +42,7 @@ pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) ->
     let datetime_import = (options.feature_time && api.uses_time()).then(|| {
         quote! { use super::{Date, DateTime}; }
     });
+    let const_helpers = emit_const_helpers(api, names, &requests);
     quote! {
         #[forbid(unsafe_code)]
         #[allow(dead_code, unused_imports)]
@@ -47,6 +51,7 @@ pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) ->
             use std::collections::BTreeMap;
             #datetime_import
             #presence_helper
+            #const_helpers
 
             #(#items)*
         }
@@ -1295,6 +1300,29 @@ fn emit_servers(api: &Api, names: &Names) -> TokenStream {
     if api.servers.is_empty() {
         return quote! {};
     }
+    // One fixed, unnamed server has nothing to configure, so a builder type would only add a
+    // positional name. `default_url` is the whole surface.
+    if let [server] = api.servers.as_slice() {
+        if server.name.is_none() && server.variables.is_empty() {
+            let url = &server.url;
+            let mut doc = format!("The declared server, `{url}`.");
+            if let Some(description) = &server.description {
+                doc.push_str("\n\n");
+                doc.push_str(description);
+            }
+            let doc = normalize_rustdoc(&doc);
+            return quote! {
+                /// Base URLs declared by the API description.
+                #[allow(dead_code)]
+                pub mod servers {
+                    #[doc = #doc]
+                    pub fn default_url() -> String {
+                        #url.to_owned()
+                    }
+                }
+            };
+        }
+    }
     let builders = api.servers.iter().enumerate().map(|(index, server)| {
         let ident = names
             .servers
@@ -2318,7 +2346,7 @@ fn emit_type_def(
             let fields = object
                 .fields
                 .iter()
-                .map(|field| emit_field(id, field, names, options, request_model));
+                .map(|field| emit_field(id, field, api, names, options, request_model));
             let providers = object
                 .fields
                 .iter()
@@ -2789,6 +2817,7 @@ fn emit_type_def(
 fn emit_field(
     id: crate::ir::TypeId,
     field: &Field,
+    api: &Api,
     names: &Names,
     options: &CodegenOptions,
     request_model: bool,
@@ -2812,7 +2841,16 @@ fn emit_field(
     if !field.required && (request_model || !field.ty.nullable) {
         ty = quote! { Option<#ty> };
     }
-    let deserialize = if !request_model || (field.required && !field.ty.nullable) {
+    let presence = request_model && !field.required;
+    let deserialize = if let Some(value) = names.consts.get(&field.ty.id) {
+        // A string constant is a plain `String` whose value is checked in both directions, so it
+        // accepts and produces exactly what the one-variant enum it replaces did. The checked
+        // deserializers keep the presence rules below (a required field stays required; an
+        // optional request field keeps `deserialize_request_field`'s null handling).
+        let (de, ser) = const_helper_idents(names, value, presence);
+        let (de, ser) = (de.to_string(), ser.to_string());
+        quote! { deserialize_with = #de, serialize_with = #ser, }
+    } else if !request_model || (field.required && !field.ty.nullable) {
         // Ordinary required types already reject absence. Avoid generating redundant serde
         // wrappers for those fields; only Option's special missing-field behavior needs overriding.
         quote! {}
@@ -2850,14 +2888,134 @@ fn emit_field(
     if let Some(default) = &field.default {
         notes.push(default.doc_note.clone());
     }
-    let notes = notes
+    let notes: Vec<_> = notes
         .iter()
         .map(|note| normalize_rustdoc(note))
-        .map(|note| quote! { #[doc = #note] });
+        .map(|note| quote! { #[doc = #note] })
+        .collect();
+    // An inline type has no item to carry the property's documentation, so the field carries it.
+    // A blank line separates it from the notes, so prose ending in a list or block quote cannot
+    // swallow them as a lazy continuation.
+    let docs = names
+        .inline
+        .contains_key(&field.ty.id)
+        .then(|| api.types.get(field.ty.id))
+        .flatten()
+        .map(|def| doc_tokens(&def.docs))
+        .filter(|docs| !docs.is_empty());
+    let separator = (docs.is_some() && !notes.is_empty()).then(|| quote! { #[doc = ""] });
     quote! {
+        #docs
+        #separator
         #(#notes)*
         #[serde(rename = #wire, #serde_default #deserialize)]
         pub #ident: #ty,
+    }
+}
+
+/// The checked (de)serializer function names for a string-constant field: one generic pair per
+/// constant value (and per presence mode), shared by every field with that value.
+fn const_helper_idents(
+    names: &Names,
+    value: &str,
+    presence: bool,
+) -> (proc_macro2::Ident, proc_macro2::Ident) {
+    let stem = names
+        .const_checkers
+        .get(value)
+        .expect("constant checker allocated");
+    let stem = stem.as_str().trim_start_matches("r#");
+    let mode = if presence { "_present" } else { "" };
+    (
+        format_ident!("{}_de{}", stem, mode),
+        format_ident!("{}_ser", stem),
+    )
+}
+
+/// The checked (de)serializers for every string-constant field, plus the trait they share.
+fn emit_const_helpers(api: &Api, names: &Names, requests: &BTreeSet<TypeId>) -> TokenStream {
+    let mut used: BTreeSet<(String, bool)> = BTreeSet::new();
+    for (id, def) in api.types.iter() {
+        if !names.types.contains_key(&id) {
+            continue;
+        }
+        let TypeKind::Struct(object) = &def.kind else {
+            continue;
+        };
+        for field in &object.fields {
+            if let Some(value) = names.consts.get(&field.ty.id) {
+                used.insert((value.clone(), requests.contains(&id) && !field.required));
+            }
+        }
+    }
+    if used.is_empty() {
+        return quote! {};
+    }
+    let values: BTreeSet<&String> = used.iter().map(|(value, _)| value).collect();
+    let serializers = values.iter().map(|value| {
+        let (_, ser) = const_helper_idents(names, value, false);
+        let error = format!("expected the constant {value:?}");
+        quote! {
+            fn #ser<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+                T: Serialize + ConstField,
+            {
+                if value.matches_const(#value) {
+                    value.serialize(serializer)
+                } else {
+                    Err(serde::ser::Error::custom(#error))
+                }
+            }
+        }
+    });
+    let deserializers = used.iter().map(|(value, presence)| {
+        let (de, _) = const_helper_idents(names, value, *presence);
+        let error = format!("expected the constant {value:?}");
+        let (output, read) = if *presence {
+            (
+                quote! { Option<T> },
+                quote! { deserialize_request_field(deserializer)? },
+            )
+        } else {
+            (quote! { T }, quote! { T::deserialize(deserializer)? })
+        };
+        quote! {
+            fn #de<'de, D, T>(deserializer: D) -> Result<#output, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+                T: Deserialize<'de> + ConstField,
+            {
+                let value = #read;
+                if value.matches_const(#value) {
+                    Ok(value)
+                } else {
+                    Err(serde::de::Error::custom(#error))
+                }
+            }
+        }
+    });
+    quote! {
+        // A string constant field holds a plain `String`; these check it against the constant.
+        // Absence and `null` stay governed by the field's own optionality and nullability.
+        trait ConstField {
+            fn matches_const(&self, expected: &str) -> bool;
+        }
+        impl ConstField for String {
+            fn matches_const(&self, expected: &str) -> bool {
+                self == expected
+            }
+        }
+        impl<T: ConstField> ConstField for Option<T> {
+            fn matches_const(&self, expected: &str) -> bool {
+                match self {
+                    Some(value) => value.matches_const(expected),
+                    None => true,
+                }
+            }
+        }
+        #(#serializers)*
+        #(#deserializers)*
     }
 }
 
@@ -2913,6 +3071,9 @@ fn default_value_tokens(value: &crate::ir::DefaultValue, ty: Ty, names: &Names) 
             quote! { #literal }
         }
         DefaultValue::Str(value) => quote! { #value.to_owned() },
+        DefaultValue::EnumVariant(value) if names.consts.contains_key(&ty.id) => {
+            quote! { #value.to_owned() }
+        }
         DefaultValue::EnumVariant(value) => {
             let enum_ident = names.types.get(&ty.id).expect("enum type name allocated");
             let variant_ident = names
@@ -2949,12 +3110,17 @@ fn type_kind_tokens(
     }
 }
 
-fn ty_tokens(ty: Ty, names: &Names, _options: &CodegenOptions, qualified: bool) -> TokenStream {
-    let ident = names.types.get(&ty.id).expect("type name allocated");
-    let mut tokens = if qualified {
-        quote! { types::#ident }
-    } else {
-        quote! { #ident }
+fn ty_tokens(ty: Ty, names: &Names, options: &CodegenOptions, qualified: bool) -> TokenStream {
+    let mut tokens = match names.inline.get(&ty.id) {
+        Some(kind) => inline_kind_tokens(kind, names, options, qualified),
+        None => {
+            let ident = names.types.get(&ty.id).expect("type name allocated");
+            if qualified {
+                quote! { types::#ident }
+            } else {
+                quote! { #ident }
+            }
+        }
     };
     if ty.boxed {
         tokens = quote! { Box<#tokens> };
@@ -2963,6 +3129,52 @@ fn ty_tokens(ty: Ty, names: &Names, _options: &CodegenOptions, qualified: bool) 
         tokens = quote! { Option<#tokens> };
     }
     tokens
+}
+
+/// The Rust spelling of an inline (unnamed structural) type. Element types recurse through
+/// [`ty_tokens`] so a named element keeps its `types::` qualification at the crate root.
+fn inline_kind_tokens(
+    kind: &TypeKind,
+    names: &Names,
+    options: &CodegenOptions,
+    qualified: bool,
+) -> TokenStream {
+    match kind {
+        TypeKind::Primitive(prim) => prim_tokens(*prim, options),
+        TypeKind::Array(item) => {
+            let item = ty_tokens(**item, names, options, qualified);
+            quote! { Vec<#item> }
+        }
+        TypeKind::Tuple(items) => {
+            let items = items
+                .iter()
+                .map(|ty| ty_tokens(*ty, names, options, qualified));
+            // Same spelling as a named tuple alias, so inlining never changes the Rust type.
+            quote! { (#(#items),*) }
+        }
+        TypeKind::Bytes => quote! { bytes::Bytes },
+        TypeKind::Null => quote! { () },
+        TypeKind::Any => quote! { serde_json::Value },
+        TypeKind::Enum(enumeration) => match enumeration.repr {
+            // Only a field-only string constant is inline; its field checks the value.
+            ScalarRepr::String => quote! { String },
+            ScalarRepr::Int => quote! { i64 },
+            ScalarRepr::Bool => quote! { bool },
+        },
+        // A map-only object: exactly the overflow map a named wrapper struct would flatten.
+        TypeKind::Struct(object) => match &object.additional {
+            AdditionalProps::Typed(value) => {
+                let value = ty_tokens(**value, names, options, qualified);
+                quote! { std::collections::BTreeMap<String, #value> }
+            }
+            AdditionalProps::Allow | AdditionalProps::Deny => {
+                unreachable!("only map-only objects are inline")
+            }
+        },
+        TypeKind::Never | TypeKind::Union(_) => {
+            unreachable!("nominal types are always named")
+        }
+    }
 }
 
 /// Union payloads are uniformly indirect so an API's largest object variant cannot inflate every

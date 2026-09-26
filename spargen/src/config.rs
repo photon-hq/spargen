@@ -19,6 +19,7 @@
 //! uuid = true             # map `format: uuid` to `uuid::Uuid` (default true)
 //! time = true             # map `format: date-time`/`date` to the `time` crate (default true)
 //! carve = false           # auto-carve unsupported constructs (same as `--carve`)
+//! strict_names = false    # reject hash-suffixed public names with E025 (default false)
 //! batch_cap = 100         # max diagnostics collected before batching stops
 //! error_body_cap = 65536  # max bytes of a response body retained on error variants
 //!
@@ -67,6 +68,7 @@ pub struct Spec {
     pub(crate) error_body_cap: usize,
     pub(crate) batch_cap: usize,
     pub(crate) carve: bool,
+    pub(crate) strict_names: bool,
 }
 
 impl Spec {
@@ -81,6 +83,7 @@ impl Spec {
             error_body_cap: DEFAULT_ERROR_BODY_CAP,
             batch_cap: DEFAULT_BATCH_CAP,
             carve: false,
+            strict_names: false,
         }
     }
 
@@ -137,6 +140,13 @@ impl Spec {
         self
     }
 
+    /// Strict names: when two positions would generate the same public identifier, fail with
+    /// `E025` listing them instead of giving all but one a hash-suffixed name (default `false`).
+    pub fn strict_names(mut self, enabled: bool) -> Self {
+        self.strict_names = enabled;
+        self
+    }
+
     /// Where to write the generated module. The result is the input to [`generate`](crate::generate).
     pub fn build(self, output: impl Into<Utf8PathBuf>) -> Build {
         Build::new(self, output)
@@ -189,6 +199,9 @@ impl Spec {
         }
         if let Some(value) = file.carve {
             self.carve = value;
+        }
+        if let Some(value) = file.strict_names {
+            self.strict_names = value;
         }
         if let Some(value) = file.batch_cap {
             self.batch_cap = value;
@@ -305,6 +318,7 @@ struct FileConfig {
     uuid: Option<bool>,
     time: Option<bool>,
     carve: Option<bool>,
+    strict_names: Option<bool>,
     batch_cap: Option<usize>,
     error_body_cap: Option<usize>,
     /// Retained solely to give the removed 0.2 `[features]` table a targeted error.
@@ -386,6 +400,7 @@ mod tests {
         assert!(spec.uuid);
         assert!(spec.time);
         assert!(!spec.carve);
+        assert!(!spec.strict_names);
         assert_eq!(spec.batch_cap, 100);
         assert_eq!(spec.error_body_cap, 64 * 1024);
         assert!(spec.omit.is_empty());
@@ -399,11 +414,13 @@ mod tests {
             uuid = false
             time = false
             carve = true
+            strict_names = true
             batch_cap = 7
             error_body_cap = 11
             "#,
         )
         .unwrap();
+        assert!(spec.strict_names);
         assert!(!spec.uuid);
         assert!(!spec.time);
         assert!(spec.carve);

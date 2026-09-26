@@ -1,0 +1,55 @@
+openapi: 3.1.0
+info: { title: Constants and maps, version: 1.0.0 }
+paths:
+  /events:
+    post:
+      operationId: sendEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Event' }
+      responses:
+        '200':
+          description: The event, echoed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '404':
+          description: Not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/NotFoundProblem' }
+components:
+  schemas:
+    # A string `const` field is a checked `String`, in response-only and request models alike, with
+    # every combination of requiredness and nullability.
+    NotFoundProblem:
+      type: object
+      additionalProperties: false
+      required: [code, status]
+      properties:
+        code: { type: string, const: NOT_FOUND, description: The problem code. }
+        status: { type: integer, const: 404 }
+        hint: { type: string, const: retry }
+    Event:
+      type: object
+      additionalProperties: false
+      required: [type, maybe]
+      properties:
+        type: { type: string, const: event.created }
+        maybe: { type: [string, 'null'], const: here }
+        optional: { type: string, const: sometimes }
+        optionalNullable:
+          anyOf:
+            - { type: string, const: perhaps }
+            - { type: 'null' }
+        defaulted: { type: string, const: fixed, default: fixed }
+        # Elsewhere a constant keeps its one-variant enum, which is what checks it there.
+        kinds:
+          type: array
+          items: { type: string, const: only }
+        # A map-only object is a map, not a wrapper struct.
+        labels:
+          type: object
+          additionalProperties: { type: string }

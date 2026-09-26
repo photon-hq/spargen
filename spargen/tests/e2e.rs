@@ -245,6 +245,48 @@ fn request_field_presence_compiles_and_round_trips() {
     }
 }
 
+/// String constants become checked `String` fields and map-only objects become maps. Both must
+/// keep the exact wire behaviour of the one-variant enum and wrapper struct they replace: the same
+/// accepted values, requiredness, nullability and defaults, and nothing else ever serialized.
+#[test]
+fn constant_fields_and_maps_keep_their_wire_behaviour() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(&spec, include_str!("fixtures/constants.yaml")).unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "constants_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    let path = out.join("src/lib.rs");
+    let mut code = std::fs::read_to_string(&path).unwrap();
+    assert!(code.contains("pub r#type: String,"), "{code}");
+    assert!(
+        code.contains("pub labels: Option<std::collections::BTreeMap<String, String>>"),
+        "{code}"
+    );
+    assert!(!code.contains("pub struct Eventlabels"), "{code}");
+    assert!(!code.contains("pub enum NotFoundProblemcode"), "{code}");
+    assert!(code.contains("pub enum EventkindsItem"), "{code}");
+    assert!(code.contains("The problem code."), "{code}");
+    code.push_str(include_str!("fixtures/constants-runtime.rs"));
+    std::fs::write(path, code).unwrap();
+    for args in [
+        vec!["test"],
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"],
+    ] {
+        let output = Command::new("cargo")
+            .args(args)
+            .current_dir(&out)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn all_of_union_intersections_compile_and_round_trip() {
     let temp = tempfile::tempdir().unwrap();
@@ -1480,8 +1522,8 @@ fn oas32_constructs_reach_the_wire() {
     // makes an out-of-enum region unconstructible.
     assert_eq!(oas32_client::servers::default_url(), "https://us.example.com/v1");
     assert_eq!(
-        oas32_client::servers::Server0::new()
-            .region(oas32_client::servers::Server0Region::Eu)
+        oas32_client::servers::Server::new()
+            .region(oas32_client::servers::ServerRegion::Eu)
             .version("v2")
             .url(),
         "https://eu.example.com/v2"
@@ -2461,6 +2503,15 @@ components:
       properties:
         id:
           type: string
+        # An inline property's description moves onto its field. Prose ending in a block quote must
+        # not swallow the default note that follows it (`clippy::doc_lazy_continuation`).
+        nickname:
+          type: string
+          default: ""
+          description: |-
+            What friends call the user.
+
+            > Shown instead of the name when present.
         external_id:
           type: string
           format: uuid
@@ -3148,19 +3199,23 @@ fn date_and_date_time_reach_the_wire_as_rfc3339() {
     let generated = std::fs::read_to_string(out.join("src/lib.rs")).unwrap();
     // The model resolves to the embedded newtypes, not to `time`'s own types — naming those in a
     // model is exactly the defect, since they carry the non-RFC-3339 serde implementation. (The
-    // newtype *definitions* name them, which is why this checks the aliases rather than the file.)
+    // newtype *definitions* name them, which is why this checks the fields rather than the file.)
+    // Inline scalar properties get no alias: the field spells out the newtype directly.
     assert!(
-        generated.contains("pub type Eventat = DateTime;"),
+        generated.contains("pub at: DateTime,"),
         "a date-time property must resolve to the RFC 3339 newtype: {generated}"
     );
     assert!(
-        generated.contains("pub type Eventday = Date;"),
+        generated.contains("pub day: Date,"),
         "a date property must resolve to the RFC 3339 newtype: {generated}"
     );
     assert!(
-        !generated.contains("pub type Eventat = time::")
-            && !generated.contains("pub type Eventday = time::"),
-        "no model alias may name time's own serde types"
+        !generated.contains("pub at: time::") && !generated.contains("pub day: time::"),
+        "no model field may name time's own serde types"
+    );
+    assert!(
+        !generated.contains("pub type Eventat") && !generated.contains("pub type Eventday"),
+        "inline scalar properties must not get positional aliases"
     );
     assert!(
         generated.contains("pub struct DateTime(pub time::OffsetDateTime)"),

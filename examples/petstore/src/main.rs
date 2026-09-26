@@ -68,7 +68,7 @@ async fn main() {
     // instead, but the typed surface is real and is exercised here.
     assert_eq!(petstore::servers::default_url(), "http://127.0.0.1:0");
     assert_eq!(
-        petstore::servers::Server0::new()
+        petstore::servers::Server::new()
             .host("example.test")
             .port("8443")
             .url(),

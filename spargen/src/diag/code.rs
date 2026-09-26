@@ -97,6 +97,9 @@ pub enum Code {
     CargoIntegrationDegraded,
     /// Cargo integration was required by the caller but is not available in this process.
     CargoIntegrationRequired,
+    /// Under `strict_names`, two or more positions would generate the same public identifier, so
+    /// all but one would need a hash-suffixed name.
+    GeneratedNameCollision,
 }
 
 impl Code {
@@ -135,6 +138,7 @@ impl Code {
             Code::RuntimeAuditSkipped => "W012",
             Code::CargoIntegrationDegraded => "W013",
             Code::CargoIntegrationRequired => "E024",
+            Code::GeneratedNameCollision => "E025",
         }
     }
 
@@ -182,6 +186,7 @@ impl Code {
             Code::RuntimeAuditSkipped => "runtime-dependency audit skipped",
             Code::CargoIntegrationDegraded => "cargo integration degraded",
             Code::CargoIntegrationRequired => "cargo integration required but unavailable",
+            Code::GeneratedNameCollision => "generated name collision",
         }
     }
 
@@ -284,6 +289,9 @@ impl Code {
             Code::CargoIntegrationRequired => {
                 "The caller set `CargoIntegration::Required`, declaring that this generation must be wired into Cargo — rebuild triggers emitted, consumer manifest audited — and it is not: either the process is not a build script, or no consumer manifest could be found. This is an error rather than a warning purely because the caller asked for it: `Required` exists for builds where a missed rebuild trigger would ship a client generated from a stale spec. Move the call into a `build.rs`, or relax to `CargoIntegration::Auto` (degrade with `W013`/`W012`) or `CargoIntegration::Off` (degrade silently)."
             }
+            Code::GeneratedNameCollision => {
+                "Generated names come from the document: component names, property and parameter names, enum values, operation IDs, and — for an inline schema with no name of its own — its position (`<Parent><property>`, `Variant<n>`, `Item`). When two positions produce the same Rust identifier in one scope, spargen normally keeps the first spelling and gives the others a stable suffix hashed from their JSON Pointer (`RequestId1a2b3c4d`). That suffix is deterministic but meaningless, and which position keeps the plain name depends on document order, so it is a poor public name. With `strict_names` on (`Spec::strict_names(true)` or `strict_names = true` in `spargen.toml`), every such collision in a public name — a model, field, enum or union variant, client method, parameters struct, response-header struct or field, or server builder — is this error instead, listing each position that claims the name. Fix it in the document: give each colliding schema its own `components/schemas` entry (or reuse one shared component), and put a reused response header in `components/headers`. Generator-owned local bindings inside method bodies are not public and never trigger it."
+            }
             Code::XmlHintIgnored => {
                 "XML request/response bodies honor the `xml.name` (element/attribute rename) and `xml.attribute` (serialize as an XML attribute via quick-xml's `@name` convention) hints on a field, but only for a schema used *exclusively* as an XML body. A serde `rename` is format-agnostic — it would also rewrite the JSON wire names — so `xml.name`/`xml.attribute` are NOT applied to a schema that is also reachable from a JSON/form/multipart/text body, a response, or a parameter (or that is not used as an XML body at all); the field keeps its normal wire name and this warning fires, so JSON is never corrupted. The `xml.namespace`, `xml.prefix`, and `xml.wrapped` (wrapped arrays) hints are never represented — quick-xml serde has no faithful mapping for them — so they are always ignored with this warning rather than silently honored or rejected."
             }
@@ -335,6 +343,7 @@ impl Code {
             Code::RuntimeAuditSkipped,
             Code::CargoIntegrationDegraded,
             Code::CargoIntegrationRequired,
+            Code::GeneratedNameCollision,
         ];
         ALL
     }

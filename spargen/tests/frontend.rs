@@ -335,7 +335,9 @@ components:
     assert!(code.contains("pub struct Alias"), "{code}");
     assert!(code.contains("pub struct Node"), "{code}");
     assert!(code.contains("Option<Box<Alias>>"), "{code}");
-    assert!(code.contains("pub value: Nodevalue"), "{code}");
+    // An inline scalar property is spelled out, not aliased under a positional name.
+    assert!(code.contains("pub value: String"), "{code}");
+    assert!(!code.contains("Nodevalue"), "{code}");
 }
 
 #[test]
@@ -2957,7 +2959,7 @@ paths:
         !has_code(&report, Code::DeclarationHasNoEffect),
         "the dynamic Content-Type boundary must not be discarded: {report:#?}"
     );
-    assert!(code.contains("content_type: types::ContentType"), "{code}");
+    assert!(code.contains("content_type: String"), "{code}");
     assert!(
         code.contains(".header(\n                \"content-type\""),
         "{code}"
@@ -4573,13 +4575,12 @@ components:
     );
     assert_ne!(report.outcome, Outcome::Rejected, "{report:#?}");
     assert!(code.contains("ListPetsStatus200Headers"), "{code}");
-    // A required header is a plain field; an optional one is an Option. Inline header schemas get
-    // a synthesized named type, exactly as inline schemas elsewhere do.
-    assert!(
-        code.contains("pub x_rate_limit_remaining: types::HeaderXRateLimitRemaining"),
-        "{code}"
-    );
-    assert!(code.contains("pub x_next: Option<"), "{code}");
+    // A required header is a plain field; an optional one is an Option. An inline scalar header
+    // schema is spelled out; a header component is named after the component.
+    assert!(code.contains("pub x_rate_limit_remaining: i64"), "{code}");
+    assert!(code.contains("pub x_next: Option<types::Next>"), "{code}");
+    assert!(code.contains("pub type Next = String;"), "{code}");
+    assert!(!code.contains("HeaderX"), "{code}");
     assert!(code.contains("from_response"), "{code}");
     // A documented `Content-Type` is ignored per the specification, and said so.
     assert!(
@@ -5119,4 +5120,183 @@ paths:
     );
     // The operation's own documentation is not displaced by it.
     assert!(code.contains("List them."), "{code}");
+}
+
+/// As [`check`] and [`generate_with_code`], with `strict_names` on.
+fn strict_reports(spec: &str) -> (Report, Report, String) {
+    let temp = tempfile::tempdir().unwrap();
+    let spec_path = Utf8PathBuf::from_path_buf(temp.path().join("openapi.yaml")).unwrap();
+    std::fs::write(&spec_path, spec).unwrap();
+    let out = Utf8PathBuf::from_path_buf(temp.path().join("client.rs")).unwrap();
+    let strict = Spec::new(spec_path).strict_names(true);
+    let checked = spargen::check(&strict);
+    let generated = spargen::generate(&strict.build(out.clone()).cargo(CargoIntegration::Off));
+    let code = std::fs::read_to_string(out).unwrap_or_default();
+    (checked, generated, code)
+}
+
+const COLLIDING_NAMES_SPEC: &str = r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /a:
+    get:
+      operationId: getA
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [on, off] }
+  /b:
+    get:
+      operationId: getB
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [up, down] }
+"##;
+
+#[test]
+fn e025_strict_names_reject_hash_suffixed_public_names() {
+    // Without the knob, the second inline body and its enum get stable hash suffixes.
+    let (report, code) = generate_with_code(COLLIDING_NAMES_SPEC);
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(
+        !has_code(&report, Code::GeneratedNameCollision),
+        "{report:#?}"
+    );
+    assert!(code.contains("pub enum ResponseBodystatus {"), "{code}");
+    assert_eq!(
+        code.matches("pub enum ResponseBodystatus").count(),
+        2,
+        "{code}"
+    );
+
+    // With it, `check` and `generate` both refuse, one E025 per contested name, listing every
+    // position that claims it.
+    let (checked, generated, code) = strict_reports(COLLIDING_NAMES_SPEC);
+    for report in [&checked, &generated] {
+        assert_eq!(report.outcome, Outcome::Rejected, "{report:#?}");
+        let collisions: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == Code::GeneratedNameCollision)
+            .collect();
+        assert_eq!(collisions.len(), 2, "{report:#?}");
+        let body = collisions
+            .iter()
+            .find(|d| d.message.contains("`ResponseBody`"))
+            .expect("the body collision is reported");
+        assert!(
+            body.message
+                .contains("`#/paths/~1a/get/responses/200/content/application~1json/schema`")
+                && body
+                    .message
+                    .contains("`#/paths/~1b/get/responses/200/content/application~1json/schema`"),
+            "{body:#?}"
+        );
+        assert!(collisions
+            .iter()
+            .any(|d| d.message.contains("`ResponseBodystatus`")));
+    }
+    assert!(code.is_empty(), "a rejected strict build writes nothing");
+}
+
+#[test]
+fn strict_names_accept_distinct_document_names() {
+    let (checked, generated, code) = strict_reports(
+        r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+servers:
+  - url: https://api.example.com
+paths:
+  /a/{id}:
+    get:
+      operationId: getA
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          headers:
+            RateLimit: { $ref: "#/components/headers/RateLimit" }
+            X-Request-Id: { $ref: "#/components/headers/RequestIdHeader" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/A" }
+  /b/{id}:
+    get:
+      operationId: getB
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          headers:
+            RateLimit: { $ref: "#/components/headers/RateLimit" }
+            X-Request-Id: { $ref: "#/components/headers/RequestIdHeader" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/B" }
+components:
+  headers:
+    RateLimit:
+      description: Remaining quota.
+      schema: { type: string }
+    RequestIdHeader:
+      schema: { $ref: "#/components/schemas/RequestId" }
+  schemas:
+    RequestId: { type: string, description: A request identifier. }
+    A:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, description: The display name. }
+        tags: { type: array, items: { type: string } }
+    B:
+      type: object
+      properties:
+        name: { type: string }
+"##,
+    );
+    assert_eq!(checked.outcome, Outcome::Clean, "{checked:#?}");
+    assert_eq!(generated.outcome, Outcome::Generated, "{generated:#?}");
+    // Header components are named after the component, once, however many responses use them; a
+    // header whose schema is a `$ref` keeps that schema's name.
+    assert!(code.contains("pub type RateLimit = String;"), "{code}");
+    assert!(
+        code.contains("pub rate_limit: Option<types::RateLimit>"),
+        "{code}"
+    );
+    assert!(
+        code.contains("pub x_request_id: Option<types::RequestId>"),
+        "{code}"
+    );
+    assert!(!code.contains("pub type RequestIdHeader"), "{code}");
+    assert!(!code.contains("HeaderRateLimit"), "{code}");
+    // Inline scalar properties, arrays and parameters are spelled out, with the property's docs
+    // moved onto the field.
+    assert!(code.contains("pub name: String,"), "{code}");
+    assert!(code.contains("pub tags: Option<Vec<String>>,"), "{code}");
+    assert!(code.contains("The display name."), "{code}");
+    assert!(!code.contains("pub type Aname"), "{code}");
+    assert!(!code.contains("pub type Atags"), "{code}");
+    assert!(!code.contains("pub type Id"), "{code}");
+    // A lone fixed server needs no builder type.
+    assert!(!code.contains("Server0"), "{code}");
+    assert!(!code.contains("pub struct Server"), "{code}");
+    assert!(
+        code.contains("\"https://api.example.com\".to_owned()"),
+        "{code}"
+    );
 }

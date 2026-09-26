@@ -47,3 +47,30 @@ models shared by requests and responses. Response-only models keep their existin
 Regenerating changes the Rust construction API of optional nullable request fields from `Some(v)`
 to `Some(Some(v))`; use `Some(None)` to clear a JSON field. Multipart continues to omit null parts,
 as it has no generic JSON-null part representation; this change does not define a new form encoding.
+
+### Generated names
+
+Type names come from the document. A `components/schemas` entry keeps its name, including a scalar
+component (`pub type ProjectId = String;`). A `components/headers` entry referenced from responses
+is named after the header component and lowered once for every response that uses it; a header
+whose schema is itself a `$ref` uses that schema's type. Structs, string enums and unions without a
+name of their own take a positional name (`<Parent><property>`, `Variant<n>`, `Item`).
+
+Inline scalars, arrays, tuples, bytes, `null`, untyped values, integer/boolean enums and map-only
+objects (`additionalProperties: <schema>` with no properties) get no name: the field, parameter,
+header or variant spells out the Rust type (`String`, `i64`, `DateTime`, `Vec<types::Pet>`,
+`std::collections::BTreeMap<String, T>`, …), and an inline property's description moves onto the
+field. An inline string `const` (or single-value string `enum`) used as a struct field is a
+`String` field whose value is checked when it is deserialized and serialized, so it accepts and
+produces exactly the constant; used anywhere else it stays a one-variant enum. A type that lowering
+produced but nothing in the API reaches gets no name and no item. An enum value with no letters or
+digits is named after its symbols (`*` is `Asterisk`, `#` is `Hash`).
+
+A single server with no variables and no 3.2 `name` generates only `servers::default_url()`; a
+single templated server's builder is `servers::Server`, and several unnamed servers remain
+`Server0`, `Server1`, ….
+
+When two positions produce the same Rust identifier in one scope, all but the first get a stable
+suffix hashed from their JSON Pointer. With `strict_names` on (`Spec::strict_names(true)` or
+`strict_names = true` in `spargen.toml`) that is `E025` instead, listing every position that claims
+the name, so no hash-suffixed name reaches the public API.

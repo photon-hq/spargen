@@ -56,6 +56,7 @@ pub fn lower(
         remote_components: HashMap::new(),
         remote_in_progress: HashMap::new(),
         remote_alias_stack: HashSet::new(),
+        header_components: HashMap::new(),
         depth: 0,
     };
 
@@ -419,6 +420,9 @@ struct LowerCtx<'a, 'doc> {
     /// Guards a chain of bare-`$ref` (alias) remote documents so an alias cycle terminates instead
     /// of recursing forever; a real (object/enum/…) remote schema uses the reserve/box machinery.
     remote_alias_stack: HashSet<String>,
+    /// Lowered `components/headers` schemas, keyed by header component name. Every response that
+    /// references the same header component shares one type, named after the component.
+    header_components: HashMap<String, Ty>,
     /// Current schema-lowering recursion depth, incremented on entry to [`Self::lower_schema`] and
     /// decremented on exit. A `$ref`/allOf/array/object chain that pushes this past
     /// [`MAX_SCHEMA_DEPTH`] is rejected (`E014`) rather than allowed to overflow the stack.
@@ -464,10 +468,18 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             } else if is_remote_ref(&reference.reference) {
                 self.ensure_remote(&reference.reference)
             } else {
-                self.resolver
+                let before = self.graph.len();
+                let ty = self
+                    .resolver
                     .resolve(&reference.reference, &reference.provenance, self.diags)
                     .ok()
-                    .and_then(|resolved| self.lower_schema(&resolved.schema, name))
+                    .and_then(|resolved| self.lower_schema(&resolved.schema, name));
+                // A component that aliases a non-component pointer lowers a fresh type under the
+                // component's own name, so it is document-named like any other component root.
+                if let Some(ty) = ty.filter(|ty| ty.id.0 as usize >= before) {
+                    self.graph.mark_named(ty.id);
+                }
+                ty
             };
             self.component_alias_stack.remove(name);
             if let Some(ty) = ty {
@@ -537,6 +549,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             append_doc_note(&mut def.docs, note);
         }
         self.graph.fill(root_id, def);
+        self.graph.mark_named(root_id);
         ty.id = root_id;
         // Use the reserve-time nullability consistently, so a direct return and a later cache hit
         // yield an identical `Ty` (it matches what the body lowering computed).
@@ -573,6 +586,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                     append_doc_note(&mut definition.docs, note);
                 }
                 self.graph.fill(root_id, definition);
+                self.graph.mark_named(root_id);
                 self.in_progress.remove(&name);
                 self.components.insert(name, (root_id, nullable));
                 completed.push(root_id);
@@ -674,6 +688,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             append_doc_note(&mut def.docs, note);
         }
         self.graph.fill(root_id, def);
+        self.graph.mark_named(root_id);
         ty.id = root_id;
         ty.nullable = nullable;
         self.remote_components
@@ -3267,13 +3282,18 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                     .emit(self.diags);
                 continue;
             }
-            let Some(header) = self.resolve_header(header) else {
+            let Some((header, component)) = self.resolve_header(header) else {
                 continue;
             };
             let header = &header;
+            // A header reached through `#/components/headers/<Name>` is named by the document, so
+            // its schema takes the component name and is lowered once for every response that
+            // references it. An inline header keeps a positional hint; a scalar one never surfaces
+            // as a name at all.
+            let hint = component.clone().unwrap_or_else(|| format!("Header{name}"));
             // A Header Object may only use `simple`; the document schema already enforces that.
             let (ty, shape) = if let Some(schema) = &header.schema {
-                let Some(ty) = self.lower_schema_ref(schema, &format!("Header{name}")) else {
+                let Some(ty) = self.lower_header_schema(schema, &hint, component.as_deref()) else {
                     continue;
                 };
                 let Some(shape) = self.header_shape(ty) else {
@@ -3299,11 +3319,9 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                         .emit(self.diags);
                     continue;
                 }
-                let Some(ty) = object
-                    .schema
-                    .as_ref()
-                    .and_then(|schema| self.lower_schema_ref(schema, &format!("Header{name}")))
-                else {
+                let Some(ty) = object.schema.as_ref().and_then(|schema| {
+                    self.lower_header_schema(schema, &hint, component.as_deref())
+                }) else {
                     continue;
                 };
                 (ty, crate::ir::HeaderShape::Json)
@@ -3344,16 +3362,45 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         headers
     }
 
-    /// Resolve a Header Object that may be a `$ref` into `#/components/headers/`.
+    /// Lower a response header's schema. A header component's schema is lowered once under the
+    /// component name and marked as document-named; an inline header's schema is lowered at its
+    /// position like any other inline schema.
+    fn lower_header_schema(
+        &mut self,
+        schema: &RefOr<Schema>,
+        hint: &str,
+        component: Option<&str>,
+    ) -> Option<Ty> {
+        let Some(component) = component else {
+            return self.lower_schema_ref(schema, hint);
+        };
+        if let Some(ty) = self.header_components.get(component) {
+            return Some(*ty);
+        }
+        let before = self.graph.len();
+        let ty = self.lower_schema_ref(schema, hint)?;
+        // A header whose schema is a `$ref` keeps that schema's own type and name; only a schema
+        // lowered fresh for this component takes the component's name.
+        if ty.id.0 as usize >= before {
+            self.graph.mark_named(ty.id);
+        }
+        self.header_components.insert(component.to_owned(), ty);
+        Some(ty)
+    }
+
+    /// Resolve a Header Object that may be a `$ref` into `#/components/headers/`, returning it with
+    /// the name of the header component that defines it (the last component in a `$ref` chain), or
+    /// `None` for an inline header.
     fn resolve_header(
         &mut self,
         header: &RefOr<super::HeaderObject>,
-    ) -> Option<super::HeaderObject> {
+    ) -> Option<(super::HeaderObject, Option<String>)> {
         let mut current = header.clone();
+        let mut component = None;
         let mut seen = HashSet::new();
         loop {
             match current {
-                RefOr::Item(header) => return Some(header),
+                RefOr::Item(header) => return Some((header, component)),
                 RefOr::Ref(reference) => {
                     if !seen.insert(reference.reference.clone()) {
                         Diagnostic::error(Code::UnresolvedRef, reference.provenance)
@@ -3361,11 +3408,11 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                             .emit(self.diags);
                         return None;
                     }
-                    let target = reference
-                        .reference
-                        .strip_prefix("#/components/headers/")
+                    let name = reference.reference.strip_prefix("#/components/headers/");
+                    let target = name
                         .and_then(|name| self.document.components.headers.get(name))
                         .cloned();
+                    component = name.map(str::to_owned);
                     match target {
                         Some(target) => current = target,
                         None => {

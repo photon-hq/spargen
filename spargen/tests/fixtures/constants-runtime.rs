@@ -1,0 +1,98 @@
+#[cfg(test)]
+mod constant_tests {
+    use super::types;
+    use serde_json::{json, Value};
+
+    fn event() -> Value {
+        json!({"type": "event.created", "maybe": "here"})
+    }
+
+    #[test]
+    fn constant_fields_are_plain_strings_that_round_trip() {
+        let mut input = event();
+        input["optional"] = json!("sometimes");
+        input["optionalNullable"] = json!("perhaps");
+        input["defaulted"] = json!("fixed");
+        input["kinds"] = json!(["only"]);
+        input["labels"] = json!({"a": "1", "b": "2"});
+        let parsed: types::Event = serde_json::from_value(input.clone()).unwrap();
+        let kind: &String = &parsed.r#type;
+        assert_eq!(kind, "event.created");
+        assert_eq!(parsed.labels.as_ref().unwrap()["b"], "2");
+        assert_eq!(serde_json::to_value(parsed).unwrap(), input);
+    }
+
+    #[test]
+    fn only_the_constant_is_accepted() {
+        for (field, wrong) in [
+            ("type", json!("event.deleted")),
+            ("maybe", json!("elsewhere")),
+            ("optional", json!("never")),
+            ("optionalNullable", json!("no")),
+            ("defaulted", json!("moving")),
+        ] {
+            let mut input = event();
+            input[field] = wrong;
+            assert!(serde_json::from_value::<types::Event>(input).is_err(), "{field}");
+        }
+        let mut input = event();
+        input["kinds"] = json!(["other"]);
+        assert!(serde_json::from_value::<types::Event>(input).is_err());
+        let mut input = event();
+        input["labels"] = json!({"a": 1});
+        assert!(serde_json::from_value::<types::Event>(input).is_err());
+    }
+
+    #[test]
+    fn requiredness_nullability_and_defaults_are_unchanged() {
+        // A required constant must be present; a required nullable one may be null.
+        let mut missing = event();
+        missing.as_object_mut().unwrap().remove("type");
+        assert!(serde_json::from_value::<types::Event>(missing).is_err());
+        let mut missing = event();
+        missing.as_object_mut().unwrap().remove("maybe");
+        assert!(serde_json::from_value::<types::Event>(missing).is_err());
+        let mut null = event();
+        null["maybe"] = Value::Null;
+        null["optionalNullable"] = Value::Null;
+        let parsed: types::Event = serde_json::from_value(null.clone()).unwrap();
+        assert_eq!(parsed.maybe, None);
+        assert_eq!(parsed.optional_nullable, Some(None));
+        assert_eq!(parsed.defaulted.as_deref(), Some("fixed"));
+        let mut expected = null;
+        expected["defaulted"] = json!("fixed");
+        assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
+        // A non-nullable constant rejects null.
+        let mut null = event();
+        null["type"] = Value::Null;
+        assert!(serde_json::from_value::<types::Event>(null).is_err());
+    }
+
+    #[test]
+    fn response_only_constants_are_checked_too() {
+        let problem: types::NotFoundProblem =
+            serde_json::from_value(json!({"code": "NOT_FOUND", "status": 404})).unwrap();
+        assert_eq!(problem.code, "NOT_FOUND");
+        assert_eq!(problem.hint, None);
+        assert!(serde_json::from_value::<types::NotFoundProblem>(
+            json!({"code": "GONE", "status": 404})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<types::NotFoundProblem>(
+            json!({"code": "NOT_FOUND", "status": 404, "hint": "later"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_value_other_than_the_constant_is_never_sent() {
+        let mut event: types::Event = serde_json::from_value(event()).unwrap();
+        event.r#type = "event.deleted".to_owned();
+        assert!(serde_json::to_value(&event).is_err());
+        event.r#type = "event.created".to_owned();
+        event.optional = Some("never".to_owned());
+        assert!(serde_json::to_value(&event).is_err());
+        event.optional = None;
+        assert!(serde_json::to_value(&event).is_ok());
+    }
+}

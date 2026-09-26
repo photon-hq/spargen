@@ -176,8 +176,8 @@ fn utoipa_untagged_overlap_generates_a_typed_union() {
         "the union operation is emitted"
     );
     assert!(
-        text.contains("ResponseBodyVariant0(Box<ResponseBodyVariant0>)")
-            && text.contains("ResponseBodyVariant1(Box<ResponseBodyVariant1>)"),
+        text.contains("ResponseBodyVariant0(Box<i64>)")
+            && text.contains("ResponseBodyVariant1(Box<f64>)"),
         "the overlapping response remains a typed, boxed enum: {text}"
     );
 }

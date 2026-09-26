@@ -734,6 +734,16 @@ fn keys<'a, V>(
 /// their generated name, so recursion always terminates at a nominal boundary or a primitive.
 fn canon_ty(ty: Ty, api: &Api, names: &Names) -> String {
     let base = match api.types.get(ty.id).map(|def| &def.kind) {
+        // Inline types have no name; they render as the Rust type they are spelled as.
+        Some(TypeKind::Enum(_)) if names.consts.contains_key(&ty.id) => "String".to_owned(),
+        Some(TypeKind::Struct(object)) if names.inline.contains_key(&ty.id) => {
+            match &object.additional {
+                crate::ir::AdditionalProps::Typed(value) => {
+                    format!("BTreeMap<String, {}>", canon_ty(**value, api, names))
+                }
+                _ => nominal_name(ty, names),
+            }
+        }
         Some(TypeKind::Primitive(prim)) => prim_label(*prim).to_owned(),
         Some(TypeKind::Struct(_) | TypeKind::Union(_)) => nominal_name(ty, names),
         Some(TypeKind::Enum(enumeration)) => match enumeration.repr {

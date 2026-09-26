@@ -14,6 +14,11 @@ pub struct TypeId(pub u32);
 #[derive(Debug, Clone, Default)]
 pub struct TypeGraph {
     defs: IndexMap<TypeId, TypeDef>,
+    /// Types that carry a document-given name: `components/schemas` roots, vendored remote roots,
+    /// and `components/headers` schemas. Every other structural type (a scalar, array, tuple, …) is
+    /// an inline position and is spelled out at its use sites instead of receiving a positional
+    /// alias name.
+    named: std::collections::HashSet<TypeId>,
 }
 
 impl TypeGraph {
@@ -52,7 +57,9 @@ impl TypeGraph {
     /// root — always the last def inserted while lowering its body — into its reserved id, which
     /// keeps ids dense (the freed id is immediately reused by the next insert).
     pub fn pop_last(&mut self) -> Option<(TypeId, TypeDef)> {
-        self.defs.pop()
+        let popped = self.defs.pop()?;
+        self.named.remove(&popped.0);
+        Some(popped)
     }
 
     /// The definition for `id`, if present.
@@ -64,6 +71,21 @@ impl TypeGraph {
     /// not change ids or insertion order (e.g. suppressing an XML field rename on a shared type).
     pub fn get_mut(&mut self, id: TypeId) -> Option<&mut TypeDef> {
         self.defs.get_mut(&id)
+    }
+
+    /// The number of definitions, including reserved placeholders.
+    pub fn len(&self) -> usize {
+        self.defs.len()
+    }
+
+    /// Record that `id` is named by the document (a component, remote root, or header component).
+    pub fn mark_named(&mut self, id: TypeId) {
+        self.named.insert(id);
+    }
+
+    /// Whether `id` is named by the document rather than derived from an inline position.
+    pub fn is_named(&self, id: TypeId) -> bool {
+        self.named.contains(&id)
     }
 
     /// Iterate `(id, def)` pairs in insertion order.
