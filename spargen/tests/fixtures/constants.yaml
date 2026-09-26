@@ -1,6 +1,18 @@
 openapi: 3.1.0
 info: { title: Constants and maps, version: 1.0.0 }
 paths:
+  /pets:
+    get:
+      operationId: listActivePets
+      parameters:
+        - { name: groupBy, in: query, required: true, schema: { type: string, const: day } }
+        - { name: interval, in: query, schema: { type: string, enum: [hour] } }
+      responses:
+        '200':
+          description: One active pet
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActivePet' }
   /events:
     post:
       operationId: sendEvent
@@ -53,3 +65,32 @@ components:
         labels:
           type: object
           additionalProperties: { type: string }
+    # `allOf` over a union with a constraint component: the variants keep their own types and the
+    # constraint is checked on every value.
+    Cat:
+      type: object
+      additionalProperties: false
+      required: [kind, status]
+      properties:
+        kind: { type: string, const: cat }
+        status: { type: string, enum: [active, retired] }
+    Dog:
+      type: object
+      additionalProperties: false
+      required: [kind, status]
+      properties:
+        kind: { type: string, const: dog }
+        status: { type: string, enum: [active, retired] }
+    Pet:
+      anyOf:
+        - { $ref: '#/components/schemas/Cat' }
+        - { $ref: '#/components/schemas/Dog' }
+    ActiveConstraint:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, const: active }
+    ActivePet:
+      allOf:
+        - { $ref: '#/components/schemas/Pet' }
+        - { $ref: '#/components/schemas/ActiveConstraint' }

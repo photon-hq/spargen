@@ -28,6 +28,7 @@ the library API.
 | `E023` | Error | invalid generated-runtime dependency contract |
 | `E024` | Error | cargo integration required but unavailable |
 | `E025` | Error | generated name collision (only with `strict_names`) |
+| `E026` | Error | positional generated name (only with `strict_names`) |
 | `W001` | Warning | validation-only keyword ignored |
 | `W002` | Warning | server-initiated flow ignored |
 | `W005` | Warning | schema default not applied |

@@ -6,9 +6,9 @@ use quote::{format_ident, quote};
 use std::collections::BTreeSet;
 
 use crate::ir::{
-    AdditionalProps, Api, ApiKeyLoc, DisjointFeature, ErrorShape, Field, HttpScheme, JsonCategory,
-    MediaType, Operation, ParamLoc, Prim, ScalarRepr, ScalarValue, SecurityScheme, SuccessShape,
-    Ty, TypeDef, TypeId, TypeKind, UnionMode, UnionStrategy,
+    AdditionalProps, Api, ApiKeyLoc, DisjointFeature, Docs, ErrorShape, Field, HttpScheme,
+    JsonCategory, MediaType, Operation, ParamLoc, Prim, ScalarRepr, ScalarValue, SecurityScheme,
+    SuccessShape, Ty, TypeDef, TypeId, TypeKind, UnionMode, UnionStrategy,
 };
 use crate::name::{Names, OperationBindings};
 
@@ -251,6 +251,50 @@ pub(crate) fn emit_operation(
     // verbatim with the blocking shim so the two signatures can never drift.
     let (args, _arg_names) = operation_args(operation, names, options);
 
+    // A constant parameter is a plain `String`; anything but the constant is refused before a
+    // request is built, so only the value the one-variant enum could express is ever sent.
+    let const_checks: Vec<TokenStream> = operation
+        .params
+        .iter()
+        .filter_map(|param| {
+            let value = names.consts.get(&param.ty.id)?;
+            let message = format!("parameter `{}` must be the constant {value:?}", param.name);
+            let check = |binding: TokenStream| {
+                if param.ty.nullable {
+                    quote! {
+                        if #binding.as_deref().is_some_and(|value| value != #value) {
+                            return Err(support::Error::request_message(#message));
+                        }
+                    }
+                } else {
+                    quote! {
+                        if #binding != #value {
+                            return Err(support::Error::request_message(#message));
+                        }
+                    }
+                }
+            };
+            if param.required {
+                let ident = param_ident(param, crate::name::IdentRole::Param);
+                Some(check(quote! { #ident }))
+            } else {
+                let ident = param_ident(param, crate::name::IdentRole::Field);
+                let params_binding = bindings
+                    .params
+                    .as_ref()
+                    .expect("optional parameters argument allocated");
+                let inner = check(quote! { value });
+                Some(quote! {
+                    if let Some(value) = #params_binding
+                        .as_ref()
+                        .and_then(|params| params.#ident.as_ref())
+                    {
+                        #inner
+                    }
+                })
+            }
+        })
+        .collect();
     let path_init = operation.path.raw.clone();
     let path_replacements = operation
         .params
@@ -871,6 +915,7 @@ pub(crate) fn emit_operation(
             &self,
             #(#args),*
         ) -> Result<#return_ok_ty, support::Error<#error_ty>> {
+            #(#const_checks)*
             let mut #path_binding = #path_init.to_owned();
             #(#path_replacements)*
             let mut #query_binding: Vec<String> = Vec::new();
@@ -2450,6 +2495,28 @@ fn emit_type_def(
             }
         }
         TypeKind::Union(union) => {
+            // A union narrowed by `allOf` constraint components checks each constraint against the
+            // buffered JSON value, in both directions, instead of copying every member.
+            let constraint_checks: Vec<TokenStream> = union
+                .constraints
+                .iter()
+                .map(|constraint| {
+                    let ty = ty_tokens(
+                        crate::ir::Ty {
+                            boxed: false,
+                            nullable: false,
+                            ..*constraint
+                        },
+                        names,
+                        options,
+                        false,
+                    );
+                    quote! {
+                        <#ty as serde::Deserialize>::deserialize(&value)
+                            .map_err(serde::de::Error::custom)?;
+                    }
+                })
+                .collect();
             match &union.strategy {
                 // Strategy A: a discriminator → a custom `Deserialize`/`Serialize` over a buffered
                 // `serde_json::Value`. NOT serde `#[serde(tag = ...)]`: internal tagging consumes the tag
@@ -2562,6 +2629,24 @@ fn emit_type_def(
                         Some(fallback) => fallback.clone(),
                         None => quote! { Err(serde::de::Error::custom(#unknown_tag)) },
                     };
+                    let serialize_impl = union_serialize_impl(
+                        ident,
+                        quote! {
+                                let (mut value, tag): (serde_json::Value, Option<&str>) = match self {
+                                    #(#ser_arms)*
+                                };
+                                if let Some(tag) = tag {
+                                    let serde_json::Value::Object(map) = &mut value else {
+                                        return Err(serde::ser::Error::custom(#non_object));
+                                    };
+                                    map.entry(#tag_field.to_owned()).or_insert_with(|| {
+                                        serde_json::Value::String(tag.to_owned())
+                                    });
+                                }
+                                value.serialize(serializer)
+                        },
+                        &constraint_checks,
+                    );
                     quote! {
                         #docs
                         #deprecated
@@ -2576,6 +2661,7 @@ fn emit_type_def(
                                 D: serde::Deserializer<'de>,
                             {
                                 let value = serde_json::Value::deserialize(deserializer)?;
+                                #(#constraint_checks)*
                                 #(#category_arms)*
                                 let tag = value
                                     .get(#tag_field)
@@ -2591,25 +2677,7 @@ fn emit_type_def(
                             }
                         }
 
-                        impl serde::Serialize for #ident {
-                            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                            where
-                                S: serde::Serializer,
-                            {
-                                let (mut value, tag): (serde_json::Value, Option<&str>) = match self {
-                                    #(#ser_arms)*
-                                };
-                                if let Some(tag) = tag {
-                                    let serde_json::Value::Object(map) = &mut value else {
-                                        return Err(serde::ser::Error::custom(#non_object));
-                                    };
-                                    map.entry(#tag_field.to_owned()).or_insert_with(|| {
-                                        serde_json::Value::String(tag.to_owned())
-                                    });
-                                }
-                                value.serialize(serializer)
-                            }
-                        }
+                        #serialize_impl
                     }
                 }
                 // Strategy B: no discriminator but statically-disjoint variants → an enum with a custom
@@ -2662,6 +2730,15 @@ fn emit_type_def(
                     });
                     let error_message =
                         format!("data did not match any variant of union {}", ident.as_str());
+                    let serialize_impl = union_serialize_impl(
+                        ident,
+                        quote! {
+                                match self {
+                                    #(#ser_arms)*
+                                }
+                        },
+                        &constraint_checks,
+                    );
                     quote! {
                         #docs
                         #deprecated
@@ -2676,21 +2753,13 @@ fn emit_type_def(
                                 D: serde::Deserializer<'de>,
                             {
                                 let value = serde_json::Value::deserialize(deserializer)?;
+                                #(#constraint_checks)*
                                 #(#de_arms)*
                                 Err(serde::de::Error::custom(#error_message))
                             }
                         }
 
-                        impl serde::Serialize for #ident {
-                            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                            where
-                                S: serde::Serializer,
-                            {
-                                match self {
-                                    #(#ser_arms)*
-                                }
-                            }
-                        }
+                        #serialize_impl
                     }
                 }
                 UnionStrategy::Trial { mode, priorities } => {
@@ -2759,6 +2828,22 @@ fn emit_type_def(
                         "serialized value must match {expected} typed variant of union {}",
                         ident.as_str()
                     );
+                    let serialize_impl = union_serialize_impl(
+                        ident,
+                        quote! {
+                                let value = match self {
+                                    #(#ser_arms),*
+                                };
+                                let mut match_count = 0_usize;
+                                #(#validations)*
+                                if #ser_valid {
+                                    value.serialize(serializer)
+                                } else {
+                                    Err(serde::ser::Error::custom(#ser_error))
+                                }
+                        },
+                        &constraint_checks,
+                    );
                     quote! {
                         #docs
                         #deprecated
@@ -2773,6 +2858,7 @@ fn emit_type_def(
                                 D: serde::Deserializer<'de>,
                             {
                                 let value = serde_json::Value::deserialize(deserializer)?;
+                                #(#constraint_checks)*
                                 let mut match_count = 0_usize;
                                 let mut selected: Option<(u32, Self)> = None;
                                 #(#attempts)*
@@ -2786,23 +2872,7 @@ fn emit_type_def(
                             }
                         }
 
-                        impl serde::Serialize for #ident {
-                            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                            where
-                                S: serde::Serializer,
-                            {
-                                let value = match self {
-                                    #(#ser_arms),*
-                                };
-                                let mut match_count = 0_usize;
-                                #(#validations)*
-                                if #ser_valid {
-                                    value.serialize(serializer)
-                                } else {
-                                    Err(serde::ser::Error::custom(#ser_error))
-                                }
-                            }
-                        }
+                        #serialize_impl
                     }
                 }
             }
@@ -2896,13 +2966,16 @@ fn emit_field(
     // An inline type has no item to carry the property's documentation, so the field carries it.
     // A blank line separates it from the notes, so prose ending in a list or block quote cannot
     // swallow them as a lazy continuation.
-    let docs = names
-        .inline
-        .contains_key(&field.ty.id)
-        .then(|| api.types.get(field.ty.id))
-        .flatten()
-        .map(|def| doc_tokens(&def.docs))
-        .filter(|docs| !docs.is_empty());
+    // A named type carries its own docs; the field adds the property's own docs only when they
+    // differ (a description beside a `$ref`, or on a nullable reference).
+    let docs = match api.types.get(field.ty.id) {
+        Some(def) if names.inline.contains_key(&field.ty.id) => Some(doc_tokens(&def.docs)),
+        Some(def) if field.docs != Docs::default() && field.docs != def.docs => {
+            Some(doc_tokens(&field.docs))
+        }
+        _ => None,
+    }
+    .filter(|docs| !docs.is_empty());
     let separator = (docs.is_some() && !notes.is_empty()).then(|| quote! { #[doc = ""] });
     quote! {
         #docs
@@ -3129,6 +3202,49 @@ fn ty_tokens(ty: Ty, names: &Names, options: &CodegenOptions, qualified: bool) -
         tokens = quote! { Option<#tokens> };
     }
     tokens
+}
+
+/// A union's `Serialize` impl around its strategy-specific `body` (which writes to `serializer`).
+/// With constraint checks, the body renders into a JSON value first, and the value must pass every
+/// check before it is written.
+fn union_serialize_impl(
+    ident: &crate::name::Ident,
+    body: TokenStream,
+    constraint_checks: &[TokenStream],
+) -> TokenStream {
+    if constraint_checks.is_empty() {
+        return quote! {
+            impl serde::Serialize for #ident {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    #body
+                }
+            }
+        };
+    }
+    quote! {
+        impl serde::Serialize for #ident {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let rendered = (|| -> Result<serde_json::Value, serde_json::Error> {
+                    #[allow(unused_variables)]
+                    let serializer = serde_json::value::Serializer;
+                    #body
+                })();
+                let value = rendered.map_err(serde::ser::Error::custom)?;
+                let checked = (|| -> Result<(), serde_json::Error> {
+                    #(#constraint_checks)*
+                    Ok(())
+                })();
+                checked.map_err(serde::ser::Error::custom)?;
+                value.serialize(serializer)
+            }
+        }
+    }
 }
 
 /// The Rust spelling of an inline (unnamed structural) type. Element types recurse through

@@ -95,4 +95,44 @@ mod constant_tests {
         event.optional = None;
         assert!(serde_json::to_value(&event).is_ok());
     }
+
+    #[test]
+    fn constrained_unions_accept_and_produce_only_the_intersection() {
+        for (input, ok) in [
+            (json!({"kind": "cat", "status": "active"}), true),
+            (json!({"kind": "dog", "status": "active"}), true),
+            (json!({"kind": "cat", "status": "retired"}), false),
+            (json!({"kind": "bird", "status": "active"}), false),
+        ] {
+            let parsed = serde_json::from_value::<types::ActivePet>(input.clone());
+            assert_eq!(parsed.is_ok(), ok, "{input}");
+            if let Ok(parsed) = parsed {
+                assert_eq!(serde_json::to_value(parsed).unwrap(), input);
+            }
+        }
+        let retired: types::Cat =
+            serde_json::from_value(json!({"kind": "cat", "status": "retired"})).unwrap();
+        assert!(serde_json::to_value(types::ActivePet::Cat(Box::new(retired))).is_err());
+    }
+
+    #[test]
+    fn constant_parameters_refuse_other_values_before_sending() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let client = super::Client::new("http://127.0.0.1:9").unwrap();
+        let params = super::ListActivePetsParams::default().interval("minute".to_owned());
+        for (group_by, params) in [("week", None), ("day", Some(params))] {
+            let mut call = Box::pin(client.list_active_pets(group_by.to_owned(), params));
+            let mut context = Context::from_waker(Waker::noop());
+            match call.as_mut().poll(&mut context) {
+                Poll::Ready(Err(error)) => {
+                    let source = std::error::Error::source(&error)
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    assert!(source.contains("must be the constant"), "{error}: {source}")
+                }
+                other => panic!("expected an immediate refusal, got {:?}", other.is_ready()),
+            }
+        }
+    }
 }

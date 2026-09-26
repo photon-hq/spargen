@@ -57,6 +57,8 @@ pub fn lower(
         remote_in_progress: HashMap::new(),
         remote_alias_stack: HashSet::new(),
         header_components: HashMap::new(),
+        root_depths: Vec::new(),
+        intersection_owner: None,
         depth: 0,
     };
 
@@ -423,6 +425,13 @@ struct LowerCtx<'a, 'doc> {
     /// Lowered `components/headers` schemas, keyed by header component name. Every response that
     /// references the same header component shares one type, named after the component.
     header_components: HashMap<String, Ty>,
+    /// The lowering depth at which the body of the component (or remote root) currently being
+    /// lowered sits. A union there must re-emit its single real member as the component's own def
+    /// (the component-root last-insert invariant); anywhere else it simply reuses the member type.
+    root_depths: Vec<u32>,
+    /// While an `allOf` intersects a union, the name that owns the derived member types, so a
+    /// narrowed member is named `<Owner><Member>` rather than by position.
+    intersection_owner: Option<String>,
     /// Current schema-lowering recursion depth, incremented on entry to [`Self::lower_schema`] and
     /// decremented on exit. A `$ref`/allOf/array/object chain that pushes this past
     /// [`MAX_SCHEMA_DEPTH`] is rejected (`E014`) rather than allowed to overflow the stack.
@@ -502,7 +511,9 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         let root_id = self.graph.reserve();
         self.in_progress
             .insert(name.to_owned(), (root_id, nullable));
+        self.root_depths.push(self.depth + 1);
         let lowered = self.lower_schema(schema, name);
+        self.root_depths.pop();
         self.in_progress.remove(name);
         let mut ty = lowered?;
         // An annotated $ref is parsed as a Schema, but lowering an annotation-only
@@ -673,7 +684,9 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         let root_id = self.graph.reserve();
         self.remote_in_progress
             .insert(reference.to_owned(), (root_id, nullable));
+        self.root_depths.push(self.depth + 1);
         let lowered = self.lower_schema(&schema, reference);
+        self.root_depths.pop();
         self.remote_in_progress.remove(reference);
         let mut ty = lowered?;
         let (popped_id, mut def) = self.graph.pop_last().expect("remote root def");
@@ -867,7 +880,15 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                     }
                     let mut items = Vec::new();
                     for (index, child) in schema.prefix_items.iter().enumerate() {
-                        items.push(self.lower_schema_or(child, &format!("{hint}Item{index}"))?);
+                        let before = self.graph.len();
+                        let item = self.lower_schema_or(child, &format!("{hint}Item{index}"))?;
+                        if item.id.0 as usize >= before {
+                            self.graph.mark_positional(
+                                item.id,
+                                format!("tuple item {index} has no name of its own"),
+                            );
+                        }
+                        items.push(item);
                         self.warn_structural_default_or(child, "a tuple `prefixItems` entry");
                     }
                     self.insert_schema_type(schema, hint, TypeKind::Tuple(items))
@@ -1008,9 +1029,24 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         // when the union is a component body (a bare `$ref` member would otherwise return an existing
         // id and leave the popped root mismatched).
         if real_members.len() == 1 {
+            let before = self.graph.len();
             let mut inner = self.lower_schema_or(real_members[0], hint)?;
             if let Some(sibling) = sibling {
                 inner = self.intersect_types(inner, sibling, &format!("{hint}Constrained"))?;
+            }
+            // `X | null` is `Option<X>`: away from a component root, an existing type (a `$ref`
+            // member) is reused as is rather than copied under this position's name.
+            let at_root = self.root_depths.last() == Some(&self.depth);
+            let existing = (inner.id.0 as usize) < before
+                || self.graph.is_named(inner.id)
+                || self.in_progress.values().any(|(id, _)| *id == inner.id)
+                || self
+                    .remote_in_progress
+                    .values()
+                    .any(|(id, _)| *id == inner.id);
+            if !at_root && existing {
+                inner.nullable = inner.nullable || nullable;
+                return Some(inner);
             }
             let kind = self.graph.get(inner.id).map(|def| def.kind.clone())?;
             let mut ty = self.insert_schema_type(schema, hint, kind);
@@ -1024,9 +1060,17 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         let mut variants: Vec<UnionVariant> = Vec::new();
         let mut ref_names: Vec<Option<String>> = Vec::new();
         let mut used_hints: HashSet<String> = HashSet::new();
+        let mut duplicate_refs: Vec<String> = Vec::new();
         for (index, member) in real_members.iter().enumerate() {
+            let before = self.graph.len();
             let (mut ty, ref_name) =
                 self.lower_union_variant(member, &format!("{hint}Variant{index}"))?;
+            if ref_name.is_none() && ty.id.0 as usize >= before {
+                self.graph.mark_positional(
+                    ty.id,
+                    format!("inline member {index} of a union has no name of its own"),
+                );
+            }
             if let Some(sibling) = sibling {
                 let Some(intersection) =
                     self.intersect_types(ty, sibling, &format!("{hint}Variant{index}Constrained"))
@@ -1057,6 +1101,9 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             // per-union variant table).
             let mut name_hint = base_hint.clone();
             let mut disambiguator = 2usize;
+            if used_hints.contains(&name_hint) && ref_name.is_some() {
+                duplicate_refs.push(name_hint.clone());
+            }
             while !used_hints.insert(name_hint.clone()) {
                 name_hint = format!("{base_hint}{disambiguator}");
                 disambiguator += 1;
@@ -1106,8 +1153,24 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 .unwrap_or_else(|| self.trial_strategy(&variants, mode))
         };
 
-        let mut ty =
-            self.insert_schema_type(schema, hint, TypeKind::Union(Union { variants, strategy }));
+        let mut ty = self.insert_schema_type(
+            schema,
+            hint,
+            TypeKind::Union(Union {
+                variants,
+                strategy,
+                constraints: Vec::new(),
+            }),
+        );
+        if let Some(duplicate) = duplicate_refs.first() {
+            self.graph.mark_positional(
+                ty.id,
+                format!(
+                    "two members of the union reference `{duplicate}`, so their variants can only \
+                     be told apart by position"
+                ),
+            );
+        }
         ty.nullable = nullable;
         Some(ty)
     }
@@ -1395,10 +1458,19 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             let default = self.field_default(child, ty, is_required);
             let xml = self.field_xml(child);
             let (deprecated, read_only, write_only) = field_flags(child);
+            let docs = match child {
+                SchemaOr::Schema(child) => Docs {
+                    title: child.title.clone(),
+                    description: child.description.clone(),
+                    ..Docs::default()
+                },
+                SchemaOr::Bool(_) => Docs::default(),
+            };
             fields.push(Field {
                 name: PropertyName { wire: name.clone() },
                 ty,
                 required: is_required,
+                docs,
                 deprecated,
                 read_only,
                 write_only,
@@ -1511,11 +1583,14 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 return Some(self.with_all_of_nullability(schema, ty));
             };
             for (index, member) in scalars.iter().copied().enumerate().skip(1) {
-                let Some(merged) = self.intersect_types(
+                let owner = self.intersection_owner.replace(hint.to_owned());
+                let merged = self.intersect_types(
                     intersection,
                     member,
                     &format!("{hint}Intersection{index}"),
-                ) else {
+                );
+                self.intersection_owner = owner;
+                let Some(merged) = merged else {
                     return self.reject_all_of(
                         schema,
                         "`allOf` scalar members have an empty or unrepresentable intersection",
@@ -1544,6 +1619,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 fields: member_fields,
                 additional: member_additional,
                 required: member_required,
+                ..
             } = contribution
             else {
                 continue;
@@ -1614,13 +1690,24 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             hint,
             TypeKind::Struct(Struct { fields, additional }),
         );
+        // `allOf [<union>, <constraint component>…]`: keep the union's own member types (and
+        // names) and check the constraint components against every value, rather than copying
+        // each member narrowed under a derived name. Members no value can satisfy are dropped,
+        // exactly as the typed intersection would drop them.
+        if let Some(constrained) = self.constrained_union(&contributions, &scalars, ty, hint) {
+            let mut ty = self.insert_schema_type(schema, hint, constrained);
+            ty.nullable = scalars[0].nullable;
+            return Some(self.with_all_of_nullability(schema, ty));
+        }
         // A non-object contribution can be a union of objects, not just a scalar. Reuse the
         // typed intersection path so constraints reach every branch and incompatible branches
         // are removed, while oneOf/anyOf matching semantics remain attached to the union.
         for (index, member) in scalars.iter().copied().enumerate() {
-            let Some(intersection) =
-                self.intersect_types(ty, member, &format!("{hint}Intersection{index}"))
-            else {
+            let owner = self.intersection_owner.replace(hint.to_owned());
+            let intersection =
+                self.intersect_types(ty, member, &format!("{hint}Intersection{index}"));
+            self.intersection_owner = owner;
+            let Some(intersection) = intersection else {
                 return self.reject_all_of(
                     schema,
                     "`allOf` members have an empty or unrepresentable intersection",
@@ -1636,6 +1723,62 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             ty.nullable = nullable;
         }
         Some(self.with_all_of_nullability(schema, ty))
+    }
+
+    /// The constrained-union form of an `allOf`, when it has exactly one non-object member, a union,
+    /// and every object member is a named component: the union's retained variants plus those
+    /// components as constraints. `merged` is the flattened object members, used only to decide
+    /// which variants can still hold a value.
+    fn constrained_union(
+        &mut self,
+        contributions: &[Contribution],
+        scalars: &[Ty],
+        merged: Ty,
+        hint: &str,
+    ) -> Option<TypeKind> {
+        let [union_ty] = scalars else {
+            return None;
+        };
+        let TypeKind::Union(union) = self.graph.get(union_ty.id)?.kind.clone() else {
+            return None;
+        };
+        let mut constraints = union.constraints.clone();
+        for contribution in contributions {
+            match contribution {
+                Contribution::Object {
+                    source: Some(source),
+                    ..
+                } => {
+                    if !constraints.iter().any(|known| known.id == source.id) {
+                        constraints.push(*source);
+                    }
+                }
+                Contribution::Object { source: None, .. } => return None,
+                Contribution::Scalar(_) => {}
+            }
+        }
+        if constraints.is_empty() {
+            return None;
+        }
+        let mut retained = Vec::new();
+        for (index, variant) in union.variants.iter().enumerate() {
+            // Probe only: the intersection's own defs are unreachable and never emitted.
+            let probe = self.intersect_types(variant.ty, merged, &format!("{hint}Probe{index}"));
+            if probe.is_some() {
+                retained.push(index);
+            }
+        }
+        if retained.is_empty() {
+            return None;
+        }
+        Some(TypeKind::Union(Union {
+            variants: retained
+                .iter()
+                .map(|index| union.variants[*index].clone())
+                .collect(),
+            strategy: retain_strategy(&union.strategy, &retained),
+            constraints,
+        }))
     }
 
     /// Gather every member of `schema.all_of` (source order) plus the enclosing schema's own object
@@ -1656,6 +1799,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 fields: member_fields,
                 additional: member_additional,
                 required: schema.required.clone(),
+                source: None,
             });
         }
         Some(())
@@ -1738,10 +1882,12 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                     .map(|field| field.name.wire.clone())
                     .collect();
                 let additional = structure.additional.clone();
+                let source = self.graph.is_named(ty.id).then_some(non_nullable(ty));
                 out.push(Contribution::Object {
                     fields,
                     additional,
                     required,
+                    source,
                 });
             }
             _ => out.push(Contribution::Scalar(ty)),
@@ -1760,6 +1906,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 fields,
                 additional,
                 required: schema.required.clone(),
+                source: None,
             });
         } else if schema_imposes_scalar(schema) {
             let ty = self.lower_schema(schema, hint)?;
@@ -2026,7 +2173,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 Some(self.insert_type(hint, TypeKind::Tuple(items), Docs::default(), None))
             }
             (TypeKind::Struct(left), TypeKind::Struct(right)) => {
-                self.intersect_structs(left, right, hint)
+                self.intersect_structs(a, left, b, right, hint)
             }
             (TypeKind::Union(union), _) => self.intersect_union(a, union, b, hint),
             (_, TypeKind::Union(union)) => self.intersect_union(b, union, a, hint),
@@ -2035,7 +2182,14 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         }
     }
 
-    fn intersect_structs(&mut self, left: &Struct, right: &Struct, hint: &str) -> Option<Ty> {
+    fn intersect_structs(
+        &mut self,
+        a: Ty,
+        left: &Struct,
+        b: Ty,
+        right: &Struct,
+        hint: &str,
+    ) -> Option<Ty> {
         let mut fields: IndexMap<String, Field> = left
             .fields
             .iter()
@@ -2067,12 +2221,19 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             &right.additional,
             &format!("{hint}Additional"),
         )?;
+        let fields: Vec<Field> = fields.into_values().collect();
+        // When one side already accepts exactly the intersection (the other side only restates
+        // or loosens it), the intersection *is* that side: reuse its type and name instead of
+        // emitting a structurally identical copy under a positional name.
+        if same_struct(&fields, &additional, left) {
+            return Some(non_nullable(a));
+        }
+        if same_struct(&fields, &additional, right) {
+            return Some(non_nullable(b));
+        }
         Some(self.insert_type(
             hint,
-            TypeKind::Struct(Struct {
-                fields: fields.into_values().collect(),
-                additional,
-            }),
+            TypeKind::Struct(Struct { fields, additional }),
             Docs::default(),
             None,
         ))
@@ -2088,9 +2249,33 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         let mut variants = Vec::new();
         let mut retained = Vec::new();
         for (index, variant) in union.variants.iter().enumerate() {
-            if let Some(ty) =
-                self.intersect_types(variant.ty, other, &format!("{hint}Variant{index}"))
-            {
+            // A narrowed member that is a named component becomes `<Owner><Member>`; only an
+            // unnamed member falls back to its position.
+            let named = self
+                .graph
+                .is_named(variant.ty.id)
+                .then(|| {
+                    self.graph
+                        .get(variant.ty.id)
+                        .map(|def| def.name_hint.clone())
+                })
+                .flatten();
+            let owner = self
+                .intersection_owner
+                .clone()
+                .unwrap_or_else(|| hint.to_owned());
+            let before = self.graph.len();
+            let variant_hint = match &named {
+                Some(name) => format!("{owner}{name}"),
+                None => format!("{hint}Variant{index}"),
+            };
+            if let Some(ty) = self.intersect_types(variant.ty, other, &variant_hint) {
+                if named.is_none() && ty.id.0 as usize >= before {
+                    self.graph.mark_positional(
+                        ty.id,
+                        format!("narrowed inline member {index} of a union has no name of its own"),
+                    );
+                }
                 variants.push(UnionVariant {
                     name_hint: variant.name_hint.clone(),
                     ty,
@@ -2112,35 +2297,14 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         {
             return Some(non_nullable(union_ty));
         }
-        let strategy = match &union.strategy {
-            UnionStrategy::Discriminated {
-                tag_field,
-                tags,
-                categories,
-                default_variant,
-            } => UnionStrategy::Discriminated {
-                tag_field: tag_field.clone(),
-                tags: retained.iter().map(|index| tags[*index].clone()).collect(),
-                categories: retained.iter().map(|index| categories[*index]).collect(),
-                // The fallback variant's index moves with the retained set; if the fallback itself
-                // was dropped, the union simply has no fallback any more.
-                default_variant: default_variant
-                    .and_then(|target| retained.iter().position(|index| *index == target)),
-            },
-            UnionStrategy::Disjoint { features } => UnionStrategy::Disjoint {
-                features: retained
-                    .iter()
-                    .map(|index| features[*index].clone())
-                    .collect(),
-            },
-            UnionStrategy::Trial { mode, priorities } => UnionStrategy::Trial {
-                mode: *mode,
-                priorities: retained.iter().map(|index| priorities[*index]).collect(),
-            },
-        };
+        let strategy = retain_strategy(&union.strategy, &retained);
         Some(self.insert_type(
             hint,
-            TypeKind::Union(Union { variants, strategy }),
+            TypeKind::Union(Union {
+                variants,
+                strategy,
+                constraints: union.constraints.clone(),
+            }),
             Docs::default(),
             None,
         ))
@@ -3381,7 +3545,16 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         let ty = self.lower_schema_ref(schema, hint)?;
         // A header whose schema is a `$ref` keeps that schema's own type and name; only a schema
         // lowered fresh for this component takes the component's name.
-        if ty.id.0 as usize >= before {
+        // A scalar header needs no type of its own (its Rust type is spelled out, as for any
+        // inline scalar); an enum or object header is named after the component.
+        let nominal = matches!(
+            self.graph.get(ty.id).map(|def| &def.kind),
+            Some(TypeKind::Struct(_) | TypeKind::Union(_))
+        ) || matches!(
+            self.graph.get(ty.id).map(|def| &def.kind),
+            Some(TypeKind::Enum(enumeration)) if enumeration.repr == ScalarRepr::String
+        );
+        if ty.id.0 as usize >= before && nominal {
             self.graph.mark_named(ty.id);
         }
         self.header_components.insert(component.to_owned(), ty);
@@ -3714,6 +3887,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             kind,
             docs,
             provenance: provenance.unwrap_or_else(|| self.document.provenance.clone()),
+            positional: None,
         });
         Ty {
             id,
@@ -3780,6 +3954,61 @@ fn type_accepts_null(ty: Ty, kind: &TypeKind) -> bool {
 fn non_nullable(mut ty: Ty) -> Ty {
     ty.nullable = false;
     ty
+}
+
+/// A union strategy restricted to the `retained` variant indices, in order.
+fn retain_strategy(strategy: &UnionStrategy, retained: &[usize]) -> UnionStrategy {
+    match strategy {
+        UnionStrategy::Discriminated {
+            tag_field,
+            tags,
+            categories,
+            default_variant,
+        } => UnionStrategy::Discriminated {
+            tag_field: tag_field.clone(),
+            tags: retained.iter().map(|index| tags[*index].clone()).collect(),
+            categories: retained.iter().map(|index| categories[*index]).collect(),
+            // The fallback variant's index moves with the retained set; if the fallback itself
+            // was dropped, the union simply has no fallback any more.
+            default_variant: default_variant
+                .and_then(|target| retained.iter().position(|index| *index == target)),
+        },
+        UnionStrategy::Disjoint { features } => UnionStrategy::Disjoint {
+            features: retained
+                .iter()
+                .map(|index| features[*index].clone())
+                .collect(),
+        },
+        UnionStrategy::Trial { mode, priorities } => UnionStrategy::Trial {
+            mode: *mode,
+            priorities: retained.iter().map(|index| priorities[*index]).collect(),
+        },
+    }
+}
+
+/// Whether a merged field list and `additionalProperties` policy are exactly `original`'s: the same
+/// fields in the same order, with identical types, requiredness and defaults.
+fn same_struct(fields: &[Field], additional: &AdditionalProps, original: &Struct) -> bool {
+    let same_additional = match (additional, &original.additional) {
+        (AdditionalProps::Deny, AdditionalProps::Deny)
+        | (AdditionalProps::Allow, AdditionalProps::Allow) => true,
+        (AdditionalProps::Typed(x), AdditionalProps::Typed(y)) => same_value_ty(**x, **y),
+        _ => false,
+    };
+    same_additional
+        && fields.len() == original.fields.len()
+        && fields.iter().zip(&original.fields).all(|(merged, field)| {
+            merged.name == field.name
+                && same_value_ty(merged.ty, field.ty)
+                && merged.required == field.required
+                && merged.default.as_ref().map(|d| d.applied.clone())
+                    == field.default.as_ref().map(|d| d.applied.clone())
+        })
+}
+
+/// Same type and nullability; boxing is a use-site cycle break, not part of the value.
+fn same_value_ty(left: Ty, right: Ty) -> bool {
+    left.id == right.id && left.nullable == right.nullable
 }
 
 fn same_ty(left: Ty, right: Ty) -> bool {
@@ -4757,6 +4986,8 @@ enum Contribution {
         fields: Vec<Field>,
         additional: AdditionalProps,
         required: Vec<String>,
+        /// The named component this object came from, when it is a `$ref` to one.
+        source: Option<Ty>,
     },
     Scalar(Ty),
 }

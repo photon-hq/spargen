@@ -52,9 +52,18 @@ as it has no generic JSON-null part representation; this change does not define 
 
 Type names come from the document. A `components/schemas` entry keeps its name, including a scalar
 component (`pub type ProjectId = String;`). A `components/headers` entry referenced from responses
-is named after the header component and lowered once for every response that uses it; a header
-whose schema is itself a `$ref` uses that schema's type. Structs, string enums and unions without a
-name of their own take a positional name (`<Parent><property>`, `Variant<n>`, `Item`).
+is lowered once for every response that uses it: an enum or object header is named after the
+header component, a scalar one is spelled out, and a header whose schema is itself a `$ref` uses
+that schema's type. A union variant whose member is a `$ref` is named after the referenced
+component. Structs, string enums and unions without a name of their own take a positional name
+(`<Parent><property>`, `Variant<n>`, `Item`).
+
+`X | null` (`oneOf`/`anyOf` of one schema and `null`) is `Option<X>`: a `$ref` member is used as
+is, never copied under the property's name, and the property's description moves onto the field.
+When an intersection (`allOf`) leaves one side's shape unchanged, that side's type is reused.
+`allOf` over a union plus named constraint components keeps the union's member types as variants
+(dropping members no value can satisfy) and checks each constraint component against the JSON value
+on deserialize and serialize; any other narrowed member is named `<Owner><Member>`.
 
 Inline scalars, arrays, tuples, bytes, `null`, untyped values, integer/boolean enums and map-only
 objects (`additionalProperties: <schema>` with no properties) get no name: the field, parameter,
@@ -62,7 +71,8 @@ header or variant spells out the Rust type (`String`, `i64`, `DateTime`, `Vec<ty
 `std::collections::BTreeMap<String, T>`, …), and an inline property's description moves onto the
 field. An inline string `const` (or single-value string `enum`) used as a struct field is a
 `String` field whose value is checked when it is deserialized and serialized, so it accepts and
-produces exactly the constant; used anywhere else it stays a one-variant enum. A type that lowering
+produces exactly the constant; as an operation parameter it is a `String` the client refuses to
+send with any other value; used anywhere else it stays a one-variant enum. A type that lowering
 produced but nothing in the API reaches gets no name and no item. An enum value with no letters or
 digits is named after its symbols (`*` is `Asterisk`, `#` is `Hash`), and a leading sign is part of
 the name (`-created_at` is `MinusCreatedAt`, `-Infinity` is `MinusInfinity`).
@@ -74,4 +84,6 @@ single templated server's builder is `servers::Server`, and several unnamed serv
 When two positions produce the same Rust identifier in one scope, all but the first get a stable
 suffix hashed from their JSON Pointer. With `strict_names` on (`Spec::strict_names(true)` or
 `strict_names = true` in `spargen.toml`) that is `E025` instead, listing every position that claims
-the name, so no hash-suffixed name reaches the public API.
+the name, so no hash-suffixed name reaches the public API. It also reports `E026` for every used
+type that could only be named by position: an inline union member, a tuple item, or a union with
+two members referencing the same component.

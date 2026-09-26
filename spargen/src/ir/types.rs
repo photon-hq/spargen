@@ -43,6 +43,7 @@ impl TypeGraph {
             kind: TypeKind::Any,
             docs: Docs::default(),
             provenance: Provenance::new(JsonPointer::root(), None),
+            positional: None,
         })
     }
 
@@ -88,6 +89,15 @@ impl TypeGraph {
         self.named.contains(&id)
     }
 
+    /// Record why `id`'s name is positional (see [`TypeDef::positional`]).
+    pub fn mark_positional(&mut self, id: TypeId, reason: String) {
+        if let Some(def) = self.defs.get_mut(&id) {
+            if def.positional.is_none() {
+                def.positional = Some(reason);
+            }
+        }
+    }
+
     /// Iterate `(id, def)` pairs in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (TypeId, &TypeDef)> {
         self.defs.iter().map(|(id, def)| (*id, def))
@@ -105,6 +115,10 @@ pub struct TypeDef {
     pub docs: Docs,
     /// Where the type came from.
     pub provenance: Provenance,
+    /// Why the type's name hint is positional rather than document-given (an inline union member
+    /// named `Variant<n>`, a tuple item named `Item<n>`, a union with two members referencing the
+    /// same component), or `None`. Under `strict_names` a live, named, positional type is `E026`.
+    pub positional: Option<String>,
 }
 
 /// A reference to a type, plus the two shape modifiers that ride on a use site rather than the
@@ -161,6 +175,10 @@ pub struct Union {
     pub variants: Vec<UnionVariant>,
     /// How the union is (de)serialized.
     pub strategy: UnionStrategy,
+    /// Named component types every value must also satisfy (from `allOf [<union>, <constraint>…]`).
+    /// Each is checked against the JSON value on deserialize and serialize, so the accepted and
+    /// produced values are exactly the intersection while the variants keep their own types.
+    pub constraints: Vec<Ty>,
 }
 
 /// One variant of a [`Union`]: a name hint (allocated to a Rust variant identifier by `name`) and
@@ -288,6 +306,10 @@ pub struct Field {
     pub ty: Ty,
     /// Whether the property is `required`.
     pub required: bool,
+    /// The property schema's own documentation, when the property position has any (for example
+    /// a description beside a `$ref` or on a nullable wrapper). Rendered on the field when the
+    /// field's type does not already carry it.
+    pub docs: super::Docs,
     /// `deprecated` → `#[deprecated]`.
     pub deprecated: bool,
     /// `readOnly` annotation (W-class, surfaced in rustdoc).

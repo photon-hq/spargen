@@ -558,7 +558,11 @@ pub(crate) fn carve_rules(diagnostics: &[Diagnostic]) -> Vec<OmitRule> {
     for diagnostic in diagnostics {
         // A strict-naming collision is a naming policy, not an unsupported construct: omitting API
         // surface to dodge it would be exactly the silent loss carving must never cause.
-        if diagnostic.severity != Severity::Error || diagnostic.code == Code::GeneratedNameCollision
+        if diagnostic.severity != Severity::Error
+            || matches!(
+                diagnostic.code,
+                Code::GeneratedNameCollision | Code::GeneratedPositionalName
+            )
         {
             continue;
         }

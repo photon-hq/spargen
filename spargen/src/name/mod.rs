@@ -126,21 +126,23 @@ fn is_inline(api: &Api, id: TypeId, kind: &TypeKind, field_only: &HashSet<TypeId
         }
         TypeKind::Enum(enumeration) => match enumeration.repr {
             ScalarRepr::Int | ScalarRepr::Bool => true,
-            // A string constant is a checked `String` field; elsewhere (an item, a variant, a
-            // parameter) it stays a one-variant enum, which is what enforces its value there.
+            // A string constant is a checked `String` field or parameter; elsewhere (an item, a
+            // variant, a header) it stays a one-variant enum, which is what enforces its value.
             ScalarRepr::String => enumeration.variants.len() == 1 && field_only.contains(&id),
         },
         TypeKind::Never | TypeKind::Union(_) => false,
     }
 }
 
-/// The live types referenced only as the type of a struct field, never as an item, variant, map
-/// value, parameter, body or header.
+/// The live types referenced only as the type of a struct field or an operation parameter, never
+/// as an item, variant, map value, body or header.
 fn field_only_types(api: &Api, live: &HashSet<TypeId>) -> HashSet<TypeId> {
     let mut fields = HashSet::new();
     let mut elsewhere = HashSet::new();
     for operation in &api.operations {
-        elsewhere.extend(operation.params.iter().map(|param| param.ty.id));
+        // A parameter is a checked `String` too: the client rejects any other value before
+        // sending, exactly the values its one-variant enum could express.
+        fields.extend(operation.params.iter().map(|param| param.ty.id));
         if let Some(ty) = operation.request_body.as_ref().and_then(|body| body.ty) {
             elsewhere.insert(ty.id);
         }
@@ -419,6 +421,29 @@ pub fn allocate(api: &Api, options: &NameOptions, diags: &mut Diagnostics) -> Na
         }
     }
     log.drain("type", &mut type_scope);
+    if strict {
+        for (id, def) in api.types.iter() {
+            let (Some(reason), Some(ident)) = (&def.positional, names.types.get(&id)) else {
+                continue;
+            };
+            if api.types.is_named(id) {
+                continue;
+            }
+            Diagnostic::error(
+                Code::GeneratedPositionalName,
+                Provenance::new(def.provenance.pointer.clone(), None),
+            )
+            .message(format!(
+                "`{}` would be named by position: {reason}",
+                ident.as_str()
+            ))
+            .remedy(
+                "give the schema its own `components/schemas` entry and reference it, or turn \
+                 `strict_names` off to accept positional names",
+            )
+            .emit(diags);
+        }
+    }
 
     // Checker helpers are private functions, allocated in value order so their spellings do not
     // depend on where the constants appear.
