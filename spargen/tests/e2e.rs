@@ -4175,3 +4175,88 @@ fn null_absence_and_values_stay_apart() {
         .unwrap();
     assert!(status.success(), "a present null must survive a round trip");
 }
+
+/// A member declared `false` cannot be present, `null` included. An optional `Option<T>` member
+/// otherwise reads `null` as absent, so a union variant forbidding the member still matched a value
+/// carrying `"member": null` and dropped it. Photon's problem details pair a closed variant that
+/// allows any `remediation` with an open one that forbids it; a problem with `"remediation": null`
+/// and a member added later decoded as the open variant and lost `remediation`.
+#[test]
+fn a_member_declared_false_is_refused_when_present_even_as_null() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(
+        &spec,
+        r##"
+openapi: 3.1.0
+info: { title: Forbidden, version: 1.0.0 }
+paths:
+  /problem:
+    get:
+      operationId: getProblem
+      responses:
+        "200":
+          description: A problem.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Problem" }
+components:
+  schemas:
+    Problem:
+      anyOf:
+        - $ref: "#/components/schemas/Remediable"
+        - $ref: "#/components/schemas/Plain"
+    Remediable:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        code: { type: string, const: GONE }
+        remediation: {}
+    Plain:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string, const: GONE }
+        remediation: false
+"##,
+    )
+    .unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "forbidden_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+
+    std::fs::create_dir_all(out.join("tests")).unwrap();
+    std::fs::write(
+        out.join("tests/forbidden.rs"),
+        r##"use forbidden_client::types::{Plain, Problem};
+
+#[test]
+fn the_forbidding_variant_is_not_chosen_for_a_null_member() {
+    let json = r#"{"code":"GONE","remediation":null,"addedLater":1}"#;
+    let problem: Problem = serde_json::from_str(json).unwrap();
+    assert!(matches!(problem, Problem::Remediable(_)), "{problem:?}");
+    let written = serde_json::to_value(&problem).unwrap();
+    assert_eq!(written["remediation"], serde_json::Value::Null, "{written}");
+}
+
+#[test]
+fn a_forbidden_member_is_refused_but_its_absence_is_fine() {
+    assert!(serde_json::from_str::<Plain>(r#"{"code":"GONE","remediation":null}"#).is_err());
+    let plain: Plain = serde_json::from_str(r#"{"code":"GONE","addedLater":1}"#).unwrap();
+    assert!(plain.remediation.is_none());
+}
+"##,
+    )
+    .unwrap();
+
+    let status = Command::new("cargo")
+        .args(["test", "--test", "forbidden"])
+        .current_dir(&out)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "a member declared false must never match when present"
+    );
+}

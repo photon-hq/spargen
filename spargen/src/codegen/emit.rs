@@ -3364,13 +3364,15 @@ fn emit_field(
 
 /// Whether an optional member keeps absence and `null` apart (`Option<Option<T>>` when nullable):
 /// always in a request model, and everywhere for a member whose schema admits `null` — a nullable
-/// one, or an unconstrained `{}` one, whose `serde_json::Value` holds a present `null` itself.
+/// one, or an unconstrained `{}` one, whose `serde_json::Value` holds a present `null` itself — or
+/// admits nothing at all (`false`): such a member, `null` included, is refused whenever present, so
+/// a union variant that forbids it is never chosen for a value that carries it.
 fn field_presence(field: &Field, api: &Api, request_model: bool) -> bool {
-    let any = matches!(
+    let null_is_a_value = matches!(
         api.types.get(field.ty.id).map(|def| &def.kind),
-        Some(TypeKind::Any)
+        Some(TypeKind::Any | TypeKind::Never)
     );
-    !field.required && (request_model || field.ty.nullable || any)
+    !field.required && (request_model || field.ty.nullable || null_is_a_value)
 }
 
 /// The checked (de)serializer function names for a string-constant field: one generic pair per
