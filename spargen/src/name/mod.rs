@@ -584,13 +584,20 @@ pub fn allocate(api: &Api, options: &NameOptions, diags: &mut Diagnostics) -> Na
                 // unique per union at lowering time, keeping this allocation injective in scope.
                 let mut scope = Scope::strict(strict);
                 for variant in &union.variants {
+                    // A variant named after the component it holds is spelled like that type.
+                    let role = if api.types.is_named(variant.ty.id)
+                        && api
+                            .types
+                            .get(variant.ty.id)
+                            .is_some_and(|held| held.name_hint == variant.name_hint)
+                    {
+                        IdentRole::NamedVariant
+                    } else {
+                        IdentRole::Variant
+                    };
                     names.variants.insert(
                         (id, variant.name_hint.clone()),
-                        scope.alloc(
-                            &variant.name_hint,
-                            IdentRole::Variant,
-                            &def.provenance.pointer,
-                        ),
+                        scope.alloc(&variant.name_hint, role, &def.provenance.pointer),
                     );
                 }
                 log.drain("union variant", &mut scope);
