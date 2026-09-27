@@ -2286,8 +2286,8 @@ pub(crate) fn emit_params_struct(
     }
 }
 
-/// Emit an operation's multi-status success response enum, one payload-carrying variant per
-/// documented success status (empty when the operation has zero or one success body). The variant
+/// Emit an operation's multi-status success response enum, one variant per documented success
+/// status (empty unless [`crate::ir::Responses::success`] is [`SuccessShape::Enum`]). The variant
 /// is selected by HTTP status at decode time, so the enum derives only `Debug, Clone` — no
 /// whole-enum `Deserialize`, no `serde(untagged)`.
 pub(crate) fn emit_response_enum(

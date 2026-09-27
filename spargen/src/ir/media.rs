@@ -205,12 +205,17 @@ pub struct Responses {
 }
 
 impl Responses {
-    /// The success shape of the operation. A single documented success body yields plain `T`
-    /// (any bodyless success sibling, e.g. `204`, is not modeled — the common `T`-plus-`204`
-    /// shape stays `Plain`). Two or more documented success bodies yield a per-operation success
+    /// The success shape of the operation. One documented success status yields plain `T` (or
+    /// `()` when bodyless). Two or more documented success statuses yield a per-operation success
     /// enum whose entries are sorted into decode precedence (exact code ascending, then range
-    /// ascending, then `default` last) and which also carries any documented bodyless success
-    /// status as a payload-free unit variant, so no documented status is silently dropped.
+    /// ascending, then `default` last): a bodied status becomes a payload-carrying variant and a
+    /// bodyless one (e.g. `202` beside `204`, or `204` beside a bodied `200`) a unit variant, so
+    /// the caller can tell apart every status the contract distinguishes and a bodyless status is
+    /// never decoded as a body.
+    ///
+    /// The exception is a lone streaming or XML success body: those decode paths are scoped to the
+    /// single-body case (see [`Self::stream_success`] and [`Self::xml_in_multi_status`]), so that
+    /// body stays `Plain` and its bodyless siblings remain reachable through the response status.
     pub fn success(&self) -> SuccessShape {
         // A default with no explicit status entries is the operation's single success body.
         if self.by_status.is_empty() {
@@ -220,21 +225,38 @@ impl Responses {
             };
         }
 
-        let mut entries: Vec<(StatusSpec, Option<Ty>)> = Vec::new();
-        for (status, response) in &self.by_status {
-            if is_success_status(*status) {
-                entries.push((*status, response.body));
+        let success: Vec<&(StatusSpec, Response)> = self
+            .by_status
+            .iter()
+            .filter(|(status, _)| is_success_status(*status))
+            .collect();
+        let mut bodied = success
+            .iter()
+            .filter(|(_, response)| response.body.is_some());
+        let lone_body = match (bodied.next(), bodied.next()) {
+            (Some((_, response)), None) => Some(response),
+            _ => None,
+        };
+        match (success.as_slice(), lone_body) {
+            ([], _) => SuccessShape::Unit,
+            ([(_, response)], _) => match response.body {
+                Some(body) => SuccessShape::Plain(body),
+                None => SuccessShape::Unit,
+            },
+            (_, Some(response))
+                if response.stream.is_some() || response.media == Some(MediaType::Xml) =>
+            {
+                SuccessShape::Plain(response.body.expect("lone bodied response has a body"))
             }
-        }
-        finish_shape(
-            entries,
-            SuccessShape::Unit,
-            SuccessShape::Plain,
-            |mut entries| {
+            _ => {
+                let mut entries: Vec<(StatusSpec, Option<Ty>)> = success
+                    .iter()
+                    .map(|(status, response)| (*status, response.body))
+                    .collect();
                 entries.sort_by_key(|(status, _)| precedence_key(*status));
                 SuccessShape::Enum(entries)
-            },
-        )
+            }
+        }
     }
 
     /// Whether the operation's success response is a typed *stream* (`text/event-stream` or
@@ -498,16 +520,88 @@ mod tests {
         }
     }
 
+    fn success_statuses(responses: &Responses) -> Vec<(StatusSpec, bool)> {
+        match responses.success() {
+            SuccessShape::Enum(entries) => entries.iter().map(|(s, b)| (*s, b.is_some())).collect(),
+            other => panic!("expected Enum, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn single_bodied_success_with_bodyless_sibling_stays_plain() {
-        // The common `T`-plus-`204` case is NOT promoted to an enum; it stays a plain `T`.
+    fn single_bodied_success_with_bodyless_sibling_is_an_enum() {
+        // A `204` beside a bodied `200` is a distinct documented outcome with no body to decode, so
+        // both statuses get their own variant instead of the `204` being parsed as the `200` body.
         let responses = Responses {
             by_status: vec![
-                (StatusSpec::Exact(200), resp(Some(1))),
                 (StatusSpec::Exact(204), resp(None)),
+                (StatusSpec::Exact(200), resp(Some(1))),
             ],
             default: None,
         };
-        assert!(matches!(responses.success(), SuccessShape::Plain(_)));
+        assert_eq!(
+            success_statuses(&responses),
+            vec![
+                (StatusSpec::Exact(200), true),
+                (StatusSpec::Exact(204), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn all_bodyless_success_statuses_are_an_enum_of_unit_variants() {
+        // `202` (scheduled) and `204` (done) carry no body but mean different things.
+        let responses = Responses {
+            by_status: vec![
+                (StatusSpec::Exact(204), resp(None)),
+                (StatusSpec::Exact(202), resp(None)),
+            ],
+            default: None,
+        };
+        assert_eq!(
+            success_statuses(&responses),
+            vec![
+                (StatusSpec::Exact(202), false),
+                (StatusSpec::Exact(204), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn one_success_status_stays_plain_or_unit() {
+        let bodied = Responses {
+            by_status: vec![(StatusSpec::Exact(200), resp(Some(1)))],
+            default: None,
+        };
+        assert!(matches!(bodied.success(), SuccessShape::Plain(_)));
+        let bodyless = Responses {
+            by_status: vec![(StatusSpec::Exact(204), resp(None))],
+            default: None,
+        };
+        assert!(matches!(bodyless.success(), SuccessShape::Unit));
+    }
+
+    #[test]
+    fn lone_streaming_or_xml_success_body_stays_plain() {
+        // Streaming and XML decode are scoped to a single success body.
+        for response in [
+            Response {
+                stream: Some(super::Framing::Ndjson),
+                media: Some(super::MediaType::Ndjson),
+                ..resp(Some(1))
+            },
+            Response {
+                media: Some(super::MediaType::Xml),
+                ..resp(Some(1))
+            },
+        ] {
+            let responses = Responses {
+                by_status: vec![
+                    (StatusSpec::Exact(200), response),
+                    (StatusSpec::Exact(204), resp(None)),
+                ],
+                default: None,
+            };
+            assert!(matches!(responses.success(), SuccessShape::Plain(_)));
+        }
     }
 }

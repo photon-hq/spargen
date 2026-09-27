@@ -3974,3 +3974,131 @@ paths:
         .join("\n");
     assert!(messages.contains("must not be optional"), "{messages}");
 }
+
+/// Several documented success statuses are distinct outcomes even when some or all of them carry
+/// no body: a `202` "revocation scheduled" beside a `204` "revoked", or a `204` beside a bodied
+/// `200`. Each must reach the caller as its own typed variant, and a bodyless status must never be
+/// decoded as a body. Before the fix the all-bodyless operation returned `()` (the enum did not
+/// exist, so this crate failed to compile), and the `200`/`204` operation decoded the empty `204`
+/// as the `200` body and failed.
+#[test]
+fn bodyless_alternate_success_statuses_stay_distinct_on_the_wire() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(
+        &spec,
+        r##"
+openapi: 3.1.0
+info: { title: Alternates, version: 1.0.0 }
+paths:
+  /secrets/{secretId}:
+    delete:
+      operationId: deleteSecret
+      parameters:
+        - { name: secretId, in: path, required: true, schema: { type: string } }
+      responses:
+        "202":
+          description: Revocation scheduled.
+          headers:
+            Retry-After: { schema: { type: integer } }
+        "204": { description: Revoked. }
+  /items/{itemId}:
+    get:
+      operationId: getItem
+      parameters:
+        - { name: itemId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The item.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties: { id: { type: string } }
+        "204": { description: No item yet. }
+"##,
+    )
+    .unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "alternates_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+
+    std::fs::create_dir_all(out.join("tests")).unwrap();
+    std::fs::write(
+        out.join("tests/alternates.rs"),
+        r##"#![cfg(feature = "blocking")]
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
+use alternates_client::{
+    BlockingClient, DeleteSecretResponse, DeleteSecretStatus202Headers, GetItemResponse,
+};
+
+/// Serve each canned response to one connection, in order.
+fn serve(responses: &'static [&'static [u8]]) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).unwrap();
+            stream.write_all(response).unwrap();
+            stream.flush().unwrap();
+        }
+    });
+    (base, server)
+}
+
+#[test]
+fn all_bodyless_alternates_are_unit_variants() {
+    let (base, server) = serve(&[
+        b"HTTP/1.1 202 Accepted\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+    let client = BlockingClient::new(&base).unwrap();
+
+    let scheduled = client.delete_secret("s1".to_owned()).expect("202 is a documented success");
+    assert_eq!(scheduled.status().as_u16(), 202);
+    // Documented headers stay reachable beside the variant.
+    let headers = DeleteSecretStatus202Headers::from_response(&scheduled).unwrap();
+    assert_eq!(headers.retry_after, Some(30));
+    assert!(matches!(scheduled.into_inner(), DeleteSecretResponse::Status202));
+
+    let revoked = client.delete_secret("s1".to_owned()).expect("204 is a documented success");
+    assert!(matches!(revoked.into_inner(), DeleteSecretResponse::Status204));
+    server.join().unwrap();
+}
+
+#[test]
+fn a_bodyless_sibling_of_a_bodied_success_is_not_decoded() {
+    let (base, server) = serve(&[
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"id\":\"a\"}",
+        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+    let client = BlockingClient::new(&base).unwrap();
+
+    match client.get_item("a".to_owned()).expect("200 round-trips").into_inner() {
+        GetItemResponse::Status200(item) => assert_eq!(item.id, "a"),
+        other => panic!("expected Status200, got {other:?}"),
+    }
+    let empty = client.get_item("a".to_owned()).expect("an empty 204 is a documented success");
+    assert!(matches!(empty.into_inner(), GetItemResponse::Status204));
+    server.join().unwrap();
+}
+"##,
+    )
+    .unwrap();
+
+    let status = Command::new("cargo")
+        .args(["test", "--features", "blocking", "--test", "alternates"])
+        .current_dir(&out)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "every documented success status must reach the caller as its own variant"
+    );
+}
