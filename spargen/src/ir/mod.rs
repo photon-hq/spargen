@@ -27,9 +27,9 @@ pub use operation::{
     PathTemplate,
 };
 pub use types::{
-    AdditionalProps, Constraints, DefaultValue, DisjointFeature, Field, FieldDefault, JsonCategory,
-    Prim, PropertyName, ScalarEnum, ScalarRepr, ScalarValue, Struct, Ty, TypeDef, TypeGraph,
-    TypeId, TypeKind, Union, UnionMode, UnionStrategy, UnionVariant, XmlField,
+    AdditionalProps, Constraints, DisjointFeature, Field, FieldDefault, JsonCategory, Prim,
+    PropertyName, ScalarEnum, ScalarRepr, ScalarValue, Struct, Ty, TypeDef, TypeGraph, TypeId,
+    TypeKind, Union, UnionMode, UnionStrategy, UnionVariant, XmlField,
 };
 
 /// The whole lowered API: the single artifact frontends produce and backends consume.

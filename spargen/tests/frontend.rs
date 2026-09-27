@@ -3692,10 +3692,10 @@ fn w005_check_generate_parity() {
     assert!(has_code(&report, Code::SchemaDefaultNotApplied));
 }
 
-/// A representable scalar default on an optional field is applied via serde and must not raise
-/// W005 (or any error): generation succeeds and the field is documented with its default.
+/// A representable scalar default on an optional field is documented (never applied) and must not
+/// raise W005 (or any error).
 #[test]
-fn representable_scalar_default_applies_without_w005() {
+fn representable_scalar_default_documented_without_w005() {
     let report = generate(
         r##"
 openapi: 3.1.0
@@ -3820,9 +3820,9 @@ components:
 }
 
 /// An out-of-range integer default for the field's width (`int32` here) is NOT representable: it
-/// must fire W005 and stay rustdoc-only, never rendered into a literal that fails to compile.
+/// must fire W005 and is documented as written.
 #[test]
-fn out_of_range_int_default_fires_w005_and_is_not_wired() {
+fn out_of_range_int_default_fires_w005() {
     let report = generate(
         r##"
 openapi: 3.1.0

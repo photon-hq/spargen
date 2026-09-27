@@ -404,39 +404,15 @@ impl XmlField {
     }
 }
 
-/// A field's JSON Schema `default` disposition. Every `default` is given exactly one of three
-/// dispositions — never silently dropped:
-///
-/// * a representable scalar wired through serde (`applied` is `Some`), which also documents the
-///   value in rustdoc;
-/// * a representable scalar on a required (or nullable) field, documented in rustdoc only
-///   (`applied` is `None`); or
-/// * a non-representable default (object/array/null/heterogeneous or scalar-type mismatch),
-///   documented in rustdoc and reported once as `W005` during lowering (`applied` is `None`).
-#[derive(Debug, Clone)]
+/// A field's JSON Schema `default`, documented in rustdoc and never applied. The client leaves an
+/// absent optional field `None` (and does not serialize it), so the service applies its own
+/// default; filling it in would send or report a value the peer never did. A default that is not a
+/// scalar matching the field's type (object/array/null/heterogeneous or scalar-type mismatch) is
+/// also reported once as `W005` during lowering.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FieldDefault {
     /// The rustdoc note line describing the default (e.g. ``Default: `active`.``).
     pub doc_note: String,
-    /// The scalar to wire through a generated serde default provider, when the default is
-    /// representable *and* the field is a plain optional (non-required, non-nullable) scalar.
-    pub applied: Option<DefaultValue>,
-}
-
-/// A representable scalar `default`, carried so codegen can render it as a correct Rust literal for
-/// the field's Rust type.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DefaultValue {
-    /// A boolean literal.
-    Bool(bool),
-    /// An integer literal (rendered unsuffixed so it infers to the field's `i32`/`i64`).
-    Int(i64),
-    /// A floating-point literal (rendered with a decimal point).
-    Float(f64),
-    /// A string literal.
-    Str(String),
-    /// A string-repr [`ScalarEnum`] variant, identified by its wire value; codegen renders it as
-    /// the generated enum variant rather than a raw string.
-    EnumVariant(String),
 }
 
 /// The `additionalProperties` policy of a [`Struct`] (matrix: Schema shape).

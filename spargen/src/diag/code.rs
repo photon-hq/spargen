@@ -262,7 +262,7 @@ impl Code {
                 "After applying omit rules, the remaining document is structurally invalid. Omit dependent consumers too, or fix the source schema."
             }
             Code::SchemaDefaultNotApplied => {
-                "A `default` is applied as a serde deserialization default only when it is a single scalar (bool/integer/number/string) that matches the field's own scalar type or one of its enum variants. Object, array, null, heterogeneous, or type-mismatched defaults cannot be lowered to a Rust literal, so the value is recorded in the field's rustdoc but not wired — deserialization of an absent field yields `None` rather than the default."
+                "A `default` is documented in rustdoc and never applied: an absent optional field deserializes as `None` and is not serialized, so the service applies its own default. This warning marks a `default` that is not a single scalar (bool/integer/number/string) matching the field's own scalar type or one of its enum variants (an object, array, null, heterogeneous, or type-mismatched value), recorded in the field's rustdoc as written, or a `default` in a position with no field, parameter, or type to document it on."
             }
             Code::Oas32ConstructIgnored => {
                 "OpenAPI 3.2 `itemSchema` describes one item of sequential media. On a non-sequential media type it does not define any wire behavior, so spargen acknowledges and ignores it while continuing to use the complete-body `schema`. Move the item schema to sequential media such as `application/x-ndjson`, `application/json-seq`, or `text/event-stream`, or use only `schema` for ordinary media."

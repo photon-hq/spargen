@@ -58,10 +58,9 @@ mod constant_tests {
         let parsed: types::Event = serde_json::from_value(null.clone()).unwrap();
         assert_eq!(parsed.maybe, None);
         assert_eq!(parsed.optional_nullable, Some(None));
-        assert_eq!(parsed.defaulted.as_deref(), Some("fixed"));
-        let mut expected = null;
-        expected["defaulted"] = json!("fixed");
-        assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
+        // A schema `default` is documented only: the absent member stays absent.
+        assert_eq!(parsed.defaulted, None);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), null);
         // A non-nullable constant rejects null.
         let mut null = event();
         null["type"] = Value::Null;

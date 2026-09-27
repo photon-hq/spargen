@@ -2525,10 +2525,6 @@ fn emit_type_def(
                 .iter()
                 .map(|field| emit_field(id, field, api, names, options, request_model));
 
-            let providers = object
-                .fields
-                .iter()
-                .filter_map(|field| emit_default_provider(id, field, names, options));
             let additional = match &object.additional {
                 AdditionalProps::Typed(item) => {
                     let ty = ty_tokens(**item, names, options, false);
@@ -2569,7 +2565,6 @@ fn emit_type_def(
                     #additional
                 }
                 #closed
-                #(#providers)*
             }
         }
         TypeKind::Enum(enumeration) if enumeration.repr == ScalarRepr::String => {
@@ -3248,9 +3243,8 @@ fn emit_field(
     } else {
         deserialize
     };
-    // An optional field always deserializes an absent value; when the spec gives a representable
-    // scalar default, point serde at a generated provider so the default fills in rather than
-    // `None`. Otherwise fall back to `Option::default()` (`None`).
+    // An absent optional field deserializes as `None` and `None` is not serialized, even when the
+    // spec declares a `default`: the default is documented, and the service applies it.
     let serde_default = if field.required {
         // A response-only model reads a missing nullable member as `None`, also through a helper.
         if normalized && field.ty.nullable && !request_model {
@@ -3258,13 +3252,6 @@ fn emit_field(
         } else {
             quote! {}
         }
-    } else if field
-        .default
-        .as_ref()
-        .is_some_and(|default| default.applied.is_some())
-    {
-        let provider = default_provider_ident(id, ident).to_string();
-        quote! { default = #provider, skip_serializing_if = "Option::is_none", }
     } else {
         quote! { default, skip_serializing_if = "Option::is_none", }
     };
@@ -3640,72 +3627,6 @@ fn normalizing_helper(
         }
     };
     (helper, tokens)
-}
-
-/// The deterministic identifier of a field's generated serde default-provider function. Derived
-/// from the owning type's dense id plus the field's Rust identifier, so it is stable across runs
-/// and cannot collide with a `PascalCase` type ident or another field's provider.
-fn default_provider_ident(
-    id: crate::ir::TypeId,
-    field_ident: &crate::name::Ident,
-) -> proc_macro2::Ident {
-    format_ident!(
-        "default_{}_{}",
-        id.0,
-        field_ident.as_str().trim_start_matches("r#")
-    )
-}
-
-/// Emit a field's serde default-provider function, when its `default` is a representable scalar
-/// wired through serde. The function returns `Option<T>` matching the (optional) field's Rust type.
-fn emit_default_provider(
-    id: crate::ir::TypeId,
-    field: &Field,
-    names: &Names,
-    options: &CodegenOptions,
-) -> Option<TokenStream> {
-    let applied = field.default.as_ref()?.applied.as_ref()?;
-    let field_ident = names
-        .fields
-        .get(&(id, field.name.wire.clone()))
-        .expect("field name allocated");
-    let fn_ident = default_provider_ident(id, field_ident);
-    let inner_ty = ty_tokens(field.ty, names, options, false);
-    let value = default_value_tokens(applied, field.ty, names);
-    Some(quote! {
-        fn #fn_ident() -> Option<#inner_ty> {
-            Some(#value)
-        }
-    })
-}
-
-/// Render a representable default as a Rust literal (or generated enum variant) for the field's
-/// Rust type.
-fn default_value_tokens(value: &crate::ir::DefaultValue, ty: Ty, names: &Names) -> TokenStream {
-    use crate::ir::DefaultValue;
-    match value {
-        DefaultValue::Bool(value) => quote! { #value },
-        DefaultValue::Int(value) => {
-            let literal = proc_macro2::Literal::i64_unsuffixed(*value);
-            quote! { #literal }
-        }
-        DefaultValue::Float(value) => {
-            let literal = proc_macro2::Literal::f64_unsuffixed(*value);
-            quote! { #literal }
-        }
-        DefaultValue::Str(value) => quote! { #value.to_owned() },
-        DefaultValue::EnumVariant(value) if names.consts.contains_key(&ty.id) => {
-            quote! { #value.to_owned() }
-        }
-        DefaultValue::EnumVariant(value) => {
-            let enum_ident = names.types.get(&ty.id).expect("enum type name allocated");
-            let variant_ident = names
-                .variants
-                .get(&(ty.id, value.clone()))
-                .expect("variant name allocated");
-            quote! { #enum_ident::#variant_ident }
-        }
-    }
 }
 
 fn type_kind_tokens(

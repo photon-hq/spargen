@@ -876,22 +876,26 @@ fn multi_status_dispatch_uses_each_status_media_codec() {
     )
     .unwrap();
 
-    // Prove the wired serde defaults actually deserialize: an absent optional field with a
-    // representable scalar default fills in the default instead of `None`, while a required field
-    // (default rustdoc-only) still comes from the payload.
+    // Prove schema defaults are never applied: an absent optional field with a `default` decodes
+    // as `None` and is not serialized, while a required field still comes from the payload.
     std::fs::create_dir_all(out.join("tests")).unwrap();
     std::fs::write(
         out.join("tests/defaults.rs"),
         r##"
 #[test]
-fn absent_optional_fields_use_schema_defaults() {
+fn absent_optional_fields_stay_absent_despite_schema_defaults() {
     let settings: basic_client::types::Settings =
         serde_json::from_str(r#"{"retries": 7}"#).unwrap();
-    assert_eq!(settings.color.as_deref(), Some("red"));
-    assert_eq!(settings.enabled, Some(true));
-    assert_eq!(settings.ratio, Some(1.5));
+    assert_eq!(settings.color, None);
+    assert_eq!(settings.enabled, None);
+    assert_eq!(settings.ratio, None);
+    assert_eq!(settings.wide, None);
+    assert_eq!(settings.mode, None);
     assert_eq!(settings.retries, 7);
-    assert_eq!(settings.mode, Some(basic_client::types::Mode::Auto));
+    assert_eq!(
+        serde_json::to_value(&settings).unwrap(),
+        serde_json::json!({"retries": 7})
+    );
 }
 
 #[test]
@@ -2712,8 +2716,8 @@ components:
       type: string
       enum: [auto, manual]
       default: auto
-    # Exercises schema `default`: representable scalar defaults on optional fields are wired via
-    # generated serde providers; a required field's default is rustdoc-only.
+    # Exercises schema `default`: every default is documented in rustdoc and never applied, so an
+    # absent optional field decodes as `None`.
     Settings:
       type: object
       required: [retries]
@@ -2730,8 +2734,7 @@ components:
         retries:
           type: integer
           default: 3
-        # Out-of-range for i32: must NOT be serde-wired (rustdoc-only, W005). If a regression wired
-        # `Some(5000000000)` into `Option<i32>`, the generated crate's `cargo check` would fail.
+        # Out-of-range for i32: documented as written and reported (W005).
         wide:
           type: integer
           format: int32

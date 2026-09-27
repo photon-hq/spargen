@@ -4,12 +4,12 @@ use indexmap::IndexMap;
 
 use crate::diag::{Aborted, Code, Diagnostic, Diagnostics, Provenance};
 use crate::ir::{
-    AdditionalProps, Api, ApiKeyLoc, BodyEncoding, Constraints, DefaultValue, Delimiter,
-    DisjointFeature, Docs, EncodingMode, Field, FieldDefault, HttpScheme, Info, JsonCategory,
-    MediaType, Operation, OperationId, ParamLoc, ParamStyle, Parameter, PathSegment, PathTemplate,
-    Prim, PropertyEncoding, PropertyName, RequestBody, Response, ResponseHeader, Responses,
-    ScalarEnum, ScalarRepr, ScalarValue, SchemeId, SecurityScheme, SecuritySchemeDef, Server,
-    StatusSpec, Struct, Ty, TypeDef, TypeGraph, TypeId, TypeKind, Union, UnionMode, UnionStrategy,
+    AdditionalProps, Api, ApiKeyLoc, BodyEncoding, Constraints, Delimiter, DisjointFeature, Docs,
+    EncodingMode, Field, FieldDefault, HttpScheme, Info, JsonCategory, MediaType, Operation,
+    OperationId, ParamLoc, ParamStyle, Parameter, PathSegment, PathTemplate, Prim,
+    PropertyEncoding, PropertyName, RequestBody, Response, ResponseHeader, Responses, ScalarEnum,
+    ScalarRepr, ScalarValue, SchemeId, SecurityScheme, SecuritySchemeDef, Server, StatusSpec,
+    Struct, Ty, TypeDef, TypeGraph, TypeId, TypeKind, Union, UnionMode, UnionStrategy,
     UnionVariant, UrlSegment, XmlField,
 };
 use crate::name::synth_operation_id;
@@ -1469,7 +1469,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         for (name, child) in &schema.properties {
             let ty = self.lower_schema_or(child, &format!("{hint}{name}"))?;
             let is_required = required.contains(name);
-            let default = self.field_default(child, ty, is_required);
+            let default = self.field_default(child, ty);
             let xml = self.field_xml(child);
             let (deprecated, read_only, write_only) = field_flags(child);
             let docs = match child {
@@ -1680,18 +1680,11 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             }
         }
 
-        // Apply the required union, then keep required fields consistent: a serde default only fires
-        // for an absent optional field, so a field promoted to required by another member drops its
-        // applied default (it stays documented in rustdoc).
+        // Apply the required union.
         let mut fields: Vec<Field> = fields.into_values().collect();
         for field in &mut fields {
             if required.contains(&field.name.wire) {
                 field.required = true;
-            }
-            if field.required {
-                if let Some(default) = &mut field.default {
-                    default.applied = None;
-                }
             }
         }
 
@@ -2251,11 +2244,6 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                         &format!("{hint}{}", field.name.wire),
                     )?;
                     existing.required = existing.required || field.required;
-                    if existing.required {
-                        if let Some(default) = &mut existing.default {
-                            default.applied = None;
-                        }
-                    }
                 }
                 None => {
                     fields.insert(field.name.wire.clone(), field.clone());
@@ -2414,10 +2402,10 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         result
     }
 
-    /// Give a property's `default` its single explicit disposition. Returns `None` when the
-    /// property declared no `default`; otherwise a [`FieldDefault`] whose `applied` is set only for
-    /// a representable scalar on a plain optional field. A non-representable default emits `W005`.
-    fn field_default(&mut self, child: &SchemaOr, ty: Ty, required: bool) -> Option<FieldDefault> {
+    /// Document a property's `default`. Returns `None` when the property declared no `default`.
+    /// The default is never applied: an absent optional field stays `None`, so the service applies
+    /// its own default. A default that is not a scalar matching the field's type emits `W005`.
+    fn field_default(&mut self, child: &SchemaOr, ty: Ty) -> Option<FieldDefault> {
         let SchemaOr::Schema(schema) = child else {
             return None;
         };
@@ -2425,18 +2413,9 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         let classified = classify_default(raw);
         let kind = self.graph.get(ty.id).map(|def| &def.kind);
         match representable_default(&classified, kind) {
-            Some(value) => {
-                let display = default_display(&value);
-                // A serde default only fires for an absent field on deserialization, so it is wired
-                // only for a plain optional (non-required, non-nullable) scalar. A required field is
-                // always present, and a nullable field already carries `Option`; both are documented
-                // in rustdoc instead of silently ignored.
-                let applied = (!required && !ty.nullable).then_some(value);
-                Some(FieldDefault {
-                    doc_note: format!("Default: `{display}`."),
-                    applied,
-                })
-            }
+            Some(value) => Some(FieldDefault {
+                doc_note: format!("Default: `{}`.", default_display(&value)),
+            }),
             None => {
                 Diagnostic::warning(Code::SchemaDefaultNotApplied, schema.provenance.clone())
                     .message(
@@ -2450,7 +2429,6 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                     .emit(self.diags);
                 Some(FieldDefault {
                     doc_note: format!("Default (not applied): `{}`.", raw_display(raw)),
-                    applied: None,
                 })
             }
         }
@@ -4092,8 +4070,7 @@ fn same_struct(fields: &[Field], additional: &AdditionalProps, original: &Struct
             merged.name == field.name
                 && same_value_ty(merged.ty, field.ty)
                 && merged.required == field.required
-                && merged.default.as_ref().map(|d| d.applied.clone())
-                    == field.default.as_ref().map(|d| d.applied.clone())
+                && merged.default == field.default
         })
 }
 
@@ -4952,6 +4929,16 @@ fn field_flags(child: &SchemaOr) -> (bool, bool, bool) {
         SchemaOr::Bool(_) => (false, false, false),
         SchemaOr::Schema(schema) => (schema.deprecated, schema.read_only, schema.write_only),
     }
+}
+
+/// A `default` that is a scalar matching the field's lowered type, rendered in its rustdoc note.
+enum DefaultValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    /// A string-repr enum variant, identified by its wire value.
+    EnumVariant(String),
 }
 
 fn representable_default(raw: &RawDefault, kind: Option<&TypeKind>) -> Option<DefaultValue> {
