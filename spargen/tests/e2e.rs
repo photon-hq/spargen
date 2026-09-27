@@ -4102,3 +4102,76 @@ fn a_bodyless_sibling_of_a_bodied_success_is_not_decoded() {
         "every documented success status must reach the caller as its own variant"
     );
 }
+
+/// An unconstrained `{}` member admits `null`, so a present `null` is a value, not absence. An
+/// optional such member of a response-only model must decode `null` as `Some(Value::Null)` and
+/// write it back, the same way a nullable member keeps absence and `null` apart; reading it as
+/// absent dropped the member when the value was serialized again.
+#[test]
+fn an_optional_unconstrained_member_keeps_a_present_null() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(
+        &spec,
+        r##"
+openapi: 3.1.0
+info: { title: Anything, version: 1.0.0 }
+paths:
+  /problem:
+    get:
+      operationId: getProblem
+      responses:
+        "200":
+          description: A problem.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Problem" }
+components:
+  schemas:
+    Problem:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string }
+        remediation: {}
+"##,
+    )
+    .unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "anything_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+
+    std::fs::create_dir_all(out.join("tests")).unwrap();
+    std::fs::write(
+        out.join("tests/anything.rs"),
+        r##"use anything_client::types::Problem;
+
+fn round_trip(json: &str) -> Problem {
+    let value: Problem = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        serde_json::to_value(&value).unwrap(),
+        serde_json::from_str::<serde_json::Value>(json).unwrap(),
+        "{json} must serialize back unchanged"
+    );
+    value
+}
+
+#[test]
+fn null_absence_and_values_stay_apart() {
+    let null = round_trip(r#"{"code":"a","remediation":null}"#);
+    assert_eq!(null.remediation, Some(serde_json::Value::Null));
+    let absent = round_trip(r#"{"code":"a"}"#);
+    assert_eq!(absent.remediation, None);
+    round_trip(r#"{"code":"a","remediation":{"steps":[1]}}"#);
+}
+"##,
+    )
+    .unwrap();
+
+    let status = Command::new("cargo")
+        .args(["test", "--test", "anything"])
+        .current_dir(&out)
+        .status()
+        .unwrap();
+    assert!(status.success(), "a present null must survive a round trip");
+}

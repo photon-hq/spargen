@@ -99,7 +99,8 @@ alter a valid value:
 * An optional nullable member keeps absence and `null` apart as `Option<Option<T>>` (`None`
   absent, `Some(None)` null), in every model. In a model used for requests an optional
   non-nullable member is `Option<T>` and absent when `None`; in a response-only model it also
-  reads `null` as `None`.
+  reads `null` as `None`. An optional unconstrained (`{}`) member is `Option<serde_json::Value>`
+  in every model: `None` absent, `Some(Value::Null)` a present `null`.
 * An open object (no `additionalProperties`) keeps the members it does not declare in its
   `additional` map, so a decoded value serializes back unchanged. XML bodies keep their declared
   shape, since the XML codec cannot write a flattened map.
