@@ -3003,6 +3003,13 @@ fn emit_type_def(
                     }
                 }
                 UnionStrategy::Trial { mode, priorities } => {
+                    // A variant pinning a property to one value (a `const` such as
+                    // `platform: "sms"`) is chosen by that value before any variant that would
+                    // only match through open or undeclared members.
+                    let keyed = union
+                        .variants
+                        .iter()
+                        .any(|variant| constants_carried(api, variant.ty).is_some());
                     let variant_defs = union.variants.iter().map(|variant| {
                         let variant_ident = names
                             .variants
@@ -3022,7 +3029,17 @@ fn emit_type_def(
                                     .get(&(id, variant.name_hint.clone()))
                                     .expect("union variant name allocated");
                                 let ty = union_variant_ty_tokens(variant.ty, names, options);
-                                let attempt = variant_attempt(api, names, variant.ty, &ty);
+                                let mut attempt = variant_attempt(api, names, variant.ty, &ty);
+                                // In the keyed pass only the variants whose constants the value
+                                // carries are tried.
+                                if keyed {
+                                    attempt = match constants_carried(api, variant.ty) {
+                                        Some(carried) => quote! {
+                                            (!keyed || #carried).then(|| #attempt).flatten()
+                                        },
+                                        None => quote! { (!keyed).then(|| #attempt).flatten() },
+                                    };
+                                }
                                 quote! {
                                     if let Some(inner) = #attempt {
                                         match_count += 1;
@@ -3081,6 +3098,64 @@ fn emit_type_def(
                         "serialized value must match {expected} typed variant of union {}",
                         ident.as_str()
                     );
+                    let de_invalid = match mode {
+                        UnionMode::OneOf => quote! { match_count != 1 },
+                        UnionMode::AnyOf => quote! { match_count == 0 },
+                    };
+                    let pass_and_select = if keyed {
+                        let carried = union
+                            .variants
+                            .iter()
+                            .filter_map(|variant| constants_carried(api, variant.ty));
+                        quote! {
+                            let pass = |strict: bool, keyed: bool| -> (usize, Selected) {
+                                let mut match_count = 0_usize;
+                                let mut selected: Selected = None;
+                                #(#attempts)*
+                                (match_count, selected)
+                            };
+                            // Each pass is exact first, where members and enum values a variant
+                            // does not know count against it; if no variant matches exactly, the
+                            // best variant that reads the value, so a response carrying additions
+                            // still decodes. The keyed pass tries only the variants whose
+                            // constants the value carries; the others are the fallback.
+                            let select = |keyed: bool| -> (usize, Selected) {
+                                let (mut match_count, mut selected) = pass(true, keyed);
+                                if match_count == 0 && !super::support::is_strict() {
+                                    let (count, lenient) = pass(false, keyed);
+                                    match_count = count.min(1);
+                                    selected = lenient;
+                                }
+                                (match_count, selected)
+                            };
+                            let (mut match_count, mut selected) = (0_usize, None);
+                            if #(#carried)||* {
+                                (match_count, selected) = select(true);
+                            }
+                            if #de_invalid {
+                                (match_count, selected) = select(false);
+                            }
+                        }
+                    } else {
+                        quote! {
+                            let pass = |strict: bool| -> (usize, Selected) {
+                                let mut match_count = 0_usize;
+                                let mut selected: Selected = None;
+                                #(#attempts)*
+                                (match_count, selected)
+                            };
+                            // An exact pass first, where members and enum values a variant
+                            // does not know count against it; if no variant matches exactly,
+                            // the best variant that reads the value, so a response carrying
+                            // additions still decodes.
+                            let (mut match_count, mut selected) = pass(true);
+                            if match_count == 0 && !super::support::is_strict() {
+                                let (count, lenient) = pass(false);
+                                match_count = count.min(1);
+                                selected = lenient;
+                            }
+                        }
+                    };
                     let serialize_impl = union_serialize_impl(
                         ident,
                         quote! {
@@ -3121,22 +3196,7 @@ fn emit_type_def(
                                 #(#constraint_checks)*
                                 // The chosen variant, ranked by (members kept, priority).
                                 type Selected = Option<((usize, u32), #ident)>;
-                                let pass = |strict: bool| -> (usize, Selected) {
-                                    let mut match_count = 0_usize;
-                                    let mut selected: Selected = None;
-                                    #(#attempts)*
-                                    (match_count, selected)
-                                };
-                                // An exact pass first, where members and enum values a variant
-                                // does not know count against it; if no variant matches exactly,
-                                // the best variant that reads the value, so a response carrying
-                                // additions still decodes.
-                                let (mut match_count, mut selected) = pass(true);
-                                if match_count == 0 && !super::support::is_strict() {
-                                    let (count, lenient) = pass(false);
-                                    match_count = count.min(1);
-                                    selected = lenient;
-                                }
+                                #pass_and_select
                                 if #de_valid {
                                     selected
                                         .map(|(_, value)| value)
@@ -3442,6 +3502,77 @@ fn variant_normalizer(api: &Api, names: &Names, ty: Ty) -> TokenStream {
 /// An `Option<#rust>` expression: the buffered `value` read as a trial-union variant of type `ty`,
 /// normalized first, so a variant matches exactly when the value decodes as it. With `strict` (a
 /// `bool` in scope) true, members and enum values the variant does not know count against it.
+/// The constants a variant of a union declares: each required property of an object whose type
+/// admits exactly one value (`const`, or an `enum` of one value), with that value. A variant that is
+/// itself a union declares the constants all of its own variants share.
+fn variant_constants(api: &Api, ty: Ty) -> Vec<(String, ScalarValue)> {
+    variant_constants_within(api, ty, &mut BTreeSet::new())
+}
+
+fn variant_constants_within(
+    api: &Api,
+    ty: Ty,
+    visiting: &mut BTreeSet<TypeId>,
+) -> Vec<(String, ScalarValue)> {
+    if !visiting.insert(ty.id) {
+        return Vec::new();
+    }
+    let constants = match api.types.get(ty.id).map(|def| &def.kind) {
+        Some(TypeKind::Struct(structure)) => structure
+            .fields
+            .iter()
+            .filter(|field| field.required && !field.ty.nullable)
+            .filter_map(
+                |field| match api.types.get(field.ty.id).map(|def| &def.kind) {
+                    Some(TypeKind::Enum(scalar)) if scalar.variants.len() == 1 => {
+                        Some((field.name.wire.clone(), scalar.variants[0].clone()))
+                    }
+                    _ => None,
+                },
+            )
+            .collect(),
+        Some(TypeKind::Union(union)) => {
+            let mut members = union
+                .variants
+                .iter()
+                .map(|variant| variant_constants_within(api, variant.ty, visiting));
+            let first = members.next().unwrap_or_default();
+            members.fold(first, |shared, other| {
+                shared
+                    .into_iter()
+                    .filter(|constant| other.contains(constant))
+                    .collect()
+            })
+        }
+        _ => Vec::new(),
+    };
+    visiting.remove(&ty.id);
+    constants
+}
+
+/// A boolean expression over `value`: whether it carries every constant of the variant `ty`;
+/// `None` for a variant without constants.
+fn constants_carried(api: &Api, ty: Ty) -> Option<TokenStream> {
+    let checks = variant_constants(api, ty)
+        .into_iter()
+        .map(|(wire, constant)| {
+            let read = match constant {
+                ScalarValue::String(text) => {
+                    quote! { .and_then(serde_json::Value::as_str) == Some(#text) }
+                }
+                ScalarValue::Int(number) => {
+                    quote! { .and_then(serde_json::Value::as_i64) == Some(#number) }
+                }
+                ScalarValue::Bool(flag) => {
+                    quote! { .and_then(serde_json::Value::as_bool) == Some(#flag) }
+                }
+            };
+            quote! { value.get(#wire) #read }
+        })
+        .collect::<Vec<_>>();
+    (!checks.is_empty()).then(|| quote! { #(#checks)&&* })
+}
+
 fn variant_attempt(api: &Api, names: &Names, ty: Ty, rust: &TokenStream) -> TokenStream {
     let validation = super::normalize::Normalization { api, names };
     let normalize = validation.normalizer(

@@ -106,7 +106,10 @@ alter a valid value:
 * A closed object (`additionalProperties: false`) ignores members it does not declare, so a
   response carrying a member added later still decodes. A trial-matched `oneOf`/`anyOf` first
   reads each variant exactly — undeclared members of a closed object count against it — and
-  only if no variant matches exactly takes the variant that keeps the most of the value.
+  only if no variant matches exactly takes the variant that keeps the most of the value. When
+  variants pin a required property to one value (`const`, or an `enum` of one value, such as
+  `platform: "sms"`), the variants whose values the input carries are read first, the same way;
+  the other variants (such as an open fallback) are read only if none of those reads it.
 * A string enum of two or more values that a response can carry is open: besides the listed
   values it has an `Unknown(String)` variant (`Unknown<n>` if the contract lists a value named
   `Unknown`) holding any other string, which serializes back unchanged; `as_str` gives the wire

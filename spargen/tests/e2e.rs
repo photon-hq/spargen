@@ -988,6 +988,42 @@ fn overlapping_unions_enforce_one_of_and_canonicalize_any_of() {
 }
 
 #[test]
+fn constant_keyed_variants_win_over_an_open_fallback() {
+    use basic_client::types::Contact;
+    let decode = |json: serde_json::Value| serde_json::from_value::<Contact>(json).unwrap();
+
+    let sms = decode(serde_json::json!({"platform": "sms", "handle": "+1"}));
+    assert!(matches!(sms, Contact::SmsContact(_)));
+    // A member the closed variant does not declare is ignored, and the variant is kept.
+    let sms = decode(serde_json::json!({"platform": "sms", "handle": "+1", "addedLater": 1}));
+    assert!(matches!(sms, Contact::SmsContact(_)));
+    assert_eq!(
+        serde_json::to_value(&sms).unwrap(),
+        serde_json::json!({"platform": "sms", "handle": "+1"})
+    );
+    // The open variant keeps it.
+    let email = decode(serde_json::json!({"platform": "email", "address": "a@b", "addedLater": 1}));
+    assert!(matches!(email, Contact::EmailContact(_)));
+    assert_eq!(serde_json::to_value(&email).unwrap()["addedLater"], 1);
+
+    // An unknown constant, or a known one whose variant cannot read the value, is the fallback.
+    let unknown = decode(serde_json::json!({"platform": "fax", "handle": "+1"}));
+    assert!(matches!(unknown, Contact::UnknownContact(_)));
+    let unreadable = decode(serde_json::json!({"platform": "sms"}));
+    assert!(matches!(unreadable, Contact::UnknownContact(_)));
+
+    // A variant that is a union keys on the constants all of its variants share.
+    use basic_client::types::{Post, SmsPost};
+    let post: Post =
+        serde_json::from_value(serde_json::json!({"platform": "sms", "state": "sent", "addedLater": 1}))
+            .unwrap();
+    assert!(matches!(&post, Post::SmsPost(inner) if matches!(**inner, SmsPost::SmsSent(_))));
+    let post: Post =
+        serde_json::from_value(serde_json::json!({"platform": "fax", "state": "sent"})).unwrap();
+    assert!(matches!(post, Post::UnknownPost(_)));
+}
+
+#[test]
 fn a_type_array_of_scalars_and_null_is_a_nullable_union() {
     use basic_client::types::MixedCode;
     for json in [serde_json::json!(7), serde_json::json!("seven"), serde_json::Value::Null] {
@@ -2542,6 +2578,60 @@ components:
       anyOf:
         - $ref: "#/components/schemas/BroadOwner"
         - $ref: "#/components/schemas/DetailedOwner"
+    # Variants keyed by a constant beside an open fallback: a known platform with a member added
+    # later must stay its own variant, not fall to the fallback that reads it exactly.
+    SmsContact:
+      type: object
+      additionalProperties: false
+      required: [platform, handle]
+      properties:
+        platform: { type: string, const: sms }
+        handle: { type: string }
+    EmailContact:
+      type: object
+      required: [platform, address]
+      properties:
+        platform: { type: string, const: email }
+        address: { type: string }
+    UnknownContact:
+      type: object
+      required: [platform]
+      properties:
+        platform: { type: string }
+    Contact:
+      anyOf:
+        - $ref: "#/components/schemas/SmsContact"
+        - $ref: "#/components/schemas/EmailContact"
+        - $ref: "#/components/schemas/UnknownContact"
+    # The same one level down: a known platform's variant is itself a union of closed objects.
+    SmsDraft:
+      type: object
+      additionalProperties: false
+      required: [platform, state]
+      properties:
+        platform: { type: string, const: sms }
+        state: { type: string, const: draft }
+    SmsSent:
+      type: object
+      additionalProperties: false
+      required: [platform, state]
+      properties:
+        platform: { type: string, const: sms }
+        state: { type: string, const: sent }
+    SmsPost:
+      oneOf:
+        - $ref: "#/components/schemas/SmsDraft"
+        - $ref: "#/components/schemas/SmsSent"
+    UnknownPost:
+      type: object
+      required: [platform, state]
+      properties:
+        platform: { type: string }
+        state: { type: string }
+    Post:
+      anyOf:
+        - $ref: "#/components/schemas/SmsPost"
+        - $ref: "#/components/schemas/UnknownPost"
     # A type array of several scalars and null: a nullable union of the scalars.
     MixedCode:
       type: [integer, string, "null"]
@@ -2621,6 +2711,10 @@ components:
           $ref: "#/components/schemas/OneOverlap"
         any_owner:
           $ref: "#/components/schemas/AnyOwner"
+        contact:
+          $ref: "#/components/schemas/Contact"
+        post:
+          $ref: "#/components/schemas/Post"
         mixed_code:
           $ref: "#/components/schemas/MixedCode"
         mixed_content:
