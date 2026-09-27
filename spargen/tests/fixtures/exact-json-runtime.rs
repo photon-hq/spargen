@@ -120,4 +120,18 @@ mod exact_json_tests {
         // A request-only enum lists exactly the contract's values.
         assert!(serde_json::from_value::<types::Order>(json!("random")).is_err());
     }
+
+    #[test]
+    fn enums_a_response_union_constraint_carries_are_open() {
+        // Tier is also a request parameter, but a Graded response checks it through its
+        // constraint, so a tier added later still decodes.
+        let value = json!({"k": "x", "tier": "bronze"});
+        let graded: types::Graded = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(graded, types::Graded::Kiwi(_)));
+        assert_eq!(serde_json::to_value(&graded).unwrap(), value);
+        assert_eq!(
+            serde_json::from_value::<types::Tier>(json!("bronze")).unwrap(),
+            types::Tier::Unknown("bronze".to_owned())
+        );
+    }
 }

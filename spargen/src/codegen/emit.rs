@@ -122,7 +122,8 @@ fn request_model_types(api: &Api) -> BTreeSet<TypeId> {
     seen
 }
 
-/// The types reached from the given roots through fields, overflow maps, items and variants.
+/// The types reached from the given roots through fields, overflow maps, items, variants and
+/// union constraints.
 fn reachable_types(roots: impl IntoIterator<Item = TypeId>, api: &Api) -> BTreeSet<TypeId> {
     let mut pending: Vec<TypeId> = roots.into_iter().collect();
     let mut seen = BTreeSet::new();
@@ -141,6 +142,8 @@ fn reachable_types(roots: impl IntoIterator<Item = TypeId>, api: &Api) -> BTreeS
             Some(TypeKind::Tuple(items)) => pending.extend(items.iter().map(|ty| ty.id)),
             Some(TypeKind::Union(union)) => {
                 pending.extend(union.variants.iter().map(|variant| variant.ty.id));
+                // A value also passes through each constraint (`allOf [<union>, <constraint>]`).
+                pending.extend(union.constraints.iter().map(|ty| ty.id));
             }
             _ => {}
         }
