@@ -1,0 +1,77 @@
+openapi: 3.1.0
+info: { title: Exact JSON, version: 1.0.0 }
+paths:
+  /items:
+    post:
+      operationId: createItem
+      parameters:
+        - { name: label, in: query, schema: { type: string, pattern: '^\S+$' } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Item' }
+      responses:
+        '200':
+          description: The item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Item' }
+  /items/{id}:
+    get:
+      operationId: getSummary
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: A summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Summary' }
+  /items/feed:
+    get:
+      operationId: itemFeed
+      responses:
+        '200':
+          description: Items as they change
+          content:
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/Item' }
+components:
+  schemas:
+    Item:
+      type: object
+      required: [name, count, at]
+      properties:
+        name: { type: string, minLength: 2, maxLength: 3, pattern: '^\S+$' }
+        count: { type: integer, minimum: 0, exclusiveMaximum: 100, multipleOf: 2 }
+        status: { type: integer, enum: [200, 404] }
+        at: { type: string, format: date-time }
+        stamp:
+          type: string
+          format: date-time
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{3})?)?Z$'
+        tags: { type: array, items: { type: string }, minItems: 1, uniqueItems: true }
+        scores: { type: array, items: { type: number }, uniqueItems: true }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+          propertyNames: { pattern: '^[a-z]+$' }
+          maxProperties: 2
+        prefix: { type: array, prefixItems: [{ type: string, const: '*' }] }
+        gone: { not: {} }
+        nickname: { type: [string, 'null'] }
+        limits:
+          type: object
+          properties:
+            cap: { type: integer }
+          additionalProperties: { type: integer, maximum: 10 }
+    Summary:
+      type: object
+      required: [id, flag]
+      properties:
+        id: { type: string }
+        note: { type: string }
+        flag: { type: [string, 'null'] }
+        count: { type: integer }

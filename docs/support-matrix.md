@@ -87,3 +87,28 @@ suffix hashed from their JSON Pointer. With `strict_names` on (`Spec::strict_nam
 the name, so no hash-suffixed name reaches the public API. It also reports `E026` for every used
 type that could only be named by position: an inline union member, a tuple item, or a union with
 two members referencing the same component.
+
+### Exact JSON
+
+Generated models accept every value the contract allows and write it back unchanged; the
+validation-only keywords (`pattern`, lengths, bounds, sizes, formats, `uniqueItems`) are the
+server's to enforce and are not checked by the client. Where serde's defaults would refuse or
+alter a valid value:
+
+* An `integer` accepts an integral number written with a fraction (`1.0`).
+* An optional nullable member keeps absence and `null` apart as `Option<Option<T>>` (`None`
+  absent, `Some(None)` null), in every model. In a model used for requests an optional
+  non-nullable member is `Option<T>` and absent when `None`; in a response-only model it also
+  reads `null` as `None`.
+* An open object (no `additionalProperties`) keeps the members it does not declare in its
+  `additional` map, so a decoded value serializes back unchanged. XML bodies keep their declared
+  shape, since the XML codec cannot write a flattened map.
+* A `date-time` accepts every RFC 3339 spelling, lower-case `t`/`z` included, and, where the
+  schema's `pattern` allows it, one without seconds or from year 0000. A pattern requiring three
+  fraction digits is written that way.
+* An open `prefixItems` array (no `items: false`) is a `Vec<serde_json::Value>`, so it may be
+  shorter than the prefix or hold more items; `items: false` stays a Rust tuple.
+* A `oneOf`/`anyOf` with a `null` member (the recursive `JsonValue` shape) accepts `null`.
+* A component name that is already a Rust type name keeps its exact spelling (`OAuthClient`).
+
+Generated output requires `serde_json`'s `float_roundtrip` feature, so numbers are read exactly.

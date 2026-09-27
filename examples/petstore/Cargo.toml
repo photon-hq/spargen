@@ -21,7 +21,7 @@ bytes = { version = "1.12.1", features = ["serde"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "multipart"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 # `time` powers the bring-your-own retry wait (tokio::time::sleep) the example feeds RetryBackend;
 # the runtime itself never depends on tokio — timing is the caller's to supply.
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }

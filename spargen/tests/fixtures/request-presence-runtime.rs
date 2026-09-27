@@ -107,13 +107,15 @@ mod request_presence_tests {
     }
 
     #[test]
-    fn existing_nonnullable_defaults_and_response_only_interfaces_stay_valid() {
+    fn existing_nonnullable_defaults_and_response_only_models_keep_presence() {
         let mut input = required();
         input.as_object_mut().unwrap().remove("defaultValue");
         let request: types::Change = serde_json::from_value(input).unwrap();
         assert_eq!(request.default_value, Some(7));
+        // Response-only models keep absence and `null` apart as request models do.
         let response = types::ResponseOnly {
-            label: Some("value".to_owned()),
+            label: Some(Some("value".to_owned())),
+            additional: Default::default(),
         };
         assert_eq!(
             serde_json::to_value(response).unwrap(),

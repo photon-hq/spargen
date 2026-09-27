@@ -4,12 +4,12 @@ use indexmap::IndexMap;
 
 use crate::diag::{Aborted, Code, Diagnostic, Diagnostics, Provenance};
 use crate::ir::{
-    AdditionalProps, Api, ApiKeyLoc, BodyEncoding, DefaultValue, Delimiter, DisjointFeature, Docs,
-    EncodingMode, Field, FieldDefault, HttpScheme, Info, JsonCategory, MediaType, Operation,
-    OperationId, ParamLoc, ParamStyle, Parameter, PathSegment, PathTemplate, Prim,
-    PropertyEncoding, PropertyName, RequestBody, Response, ResponseHeader, Responses, ScalarEnum,
-    ScalarRepr, ScalarValue, SchemeId, SecurityScheme, SecuritySchemeDef, Server, StatusSpec,
-    Struct, Ty, TypeDef, TypeGraph, TypeId, TypeKind, Union, UnionMode, UnionStrategy,
+    AdditionalProps, Api, ApiKeyLoc, BodyEncoding, Constraints, DefaultValue, Delimiter,
+    DisjointFeature, Docs, EncodingMode, Field, FieldDefault, HttpScheme, Info, JsonCategory,
+    MediaType, Operation, OperationId, ParamLoc, ParamStyle, Parameter, PathSegment, PathTemplate,
+    Prim, PropertyEncoding, PropertyName, RequestBody, Response, ResponseHeader, Responses,
+    ScalarEnum, ScalarRepr, ScalarValue, SchemeId, SecurityScheme, SecuritySchemeDef, Server,
+    StatusSpec, Struct, Ty, TypeDef, TypeGraph, TypeId, TypeKind, Union, UnionMode, UnionStrategy,
     UnionVariant, UrlSegment, XmlField,
 };
 use crate::name::synth_operation_id;
@@ -538,8 +538,8 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                     boxed: true,
                 });
             }
-            let kind = definition.kind.clone();
-            ty.id = self.insert_schema_type(schema, name, kind).id;
+            let source = ty.id;
+            ty.id = self.reemit(schema, name, source)?.id;
         }
         let (popped_id, mut def) = self.graph.pop_last().expect("component root def");
         // Hard invariant (release too): a component root's def is always the last graph insert
@@ -562,8 +562,9 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         self.graph.fill(root_id, def);
         self.graph.mark_named(root_id);
         ty.id = root_id;
-        // Use the reserve-time nullability consistently, so a direct return and a later cache hit
-        // yield an identical `Ty` (it matches what the body lowering computed).
+        // The reserve-time nullability, widened by what the body lowering found (a union whose
+        // member accepts `null` hoists it), so a direct return and a later cache hit agree.
+        let nullable = nullable || ty.nullable;
         ty.nullable = nullable;
         self.components.insert(name.to_owned(), (root_id, nullable));
         self.finish_component_aliases(root_id);
@@ -576,17 +577,13 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             let Some(aliases) = self.pending_aliases.remove(&target) else {
                 continue;
             };
-            let kind = self
-                .graph
-                .get(target)
-                .expect("completed alias target")
-                .kind
-                .clone();
             for (name, root_id, nullable) in aliases {
                 let RefOr::Item(schema) = &self.document.components.schemas[&name] else {
                     unreachable!("only annotated schema components defer their body");
                 };
-                let ty = self.insert_schema_type(schema, &name, kind.clone());
+                let ty = self
+                    .reemit(schema, &name, target)
+                    .expect("completed alias target");
                 let (id, mut definition) = self.graph.pop_last().expect("alias definition");
                 assert_eq!(id, ty.id);
                 if let Some(raw) = &schema.default {
@@ -782,8 +779,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             let sibling = self.lower_schema(&sibling, &format!("{hint}Constraint"))?;
             let intersection =
                 self.intersect_types(referenced, sibling, &format!("{hint}ReferenceIntersection"))?;
-            let kind = self.graph.get(intersection.id)?.kind.clone();
-            let mut ty = self.insert_schema_type(schema, hint, kind);
+            let mut ty = self.reemit(schema, hint, intersection.id)?;
             ty.nullable = intersection.nullable;
             ty.boxed = intersection.boxed;
             return Some(ty);
@@ -891,7 +887,27 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                         items.push(item);
                         self.warn_structural_default_or(child, "a tuple `prefixItems` entry");
                     }
-                    self.insert_schema_type(schema, hint, TypeKind::Tuple(items))
+                    if schema.items.is_none() {
+                        // No `items: false`: the array may be shorter than the prefix and hold
+                        // anything after it, so it is a JSON array of any values. (The prefix
+                        // element types are documentation; the client does not check them.)
+                        let any = self.insert_type(
+                            &format!("{hint}Item"),
+                            TypeKind::Any,
+                            Docs::default(),
+                            None,
+                        );
+                        self.insert_schema_type(
+                            schema,
+                            hint,
+                            TypeKind::Array(Box::new(Ty {
+                                boxed: false,
+                                ..any
+                            })),
+                        )
+                    } else {
+                        self.insert_schema_type(schema, hint, TypeKind::Tuple(items))
+                    }
                 } else {
                     let mut item = match &schema.items {
                         Some(items) => {
@@ -1048,8 +1064,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 inner.nullable = inner.nullable || nullable;
                 return Some(inner);
             }
-            let kind = self.graph.get(inner.id).map(|def| def.kind.clone())?;
-            let mut ty = self.insert_schema_type(schema, hint, kind);
+            let mut ty = self.reemit(schema, hint, inner.id)?;
             ty.nullable = inner.nullable || nullable;
             ty.boxed = inner.boxed;
             return Some(ty);
@@ -1120,8 +1135,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         }
         if variants.len() == 1 {
             let inner = variants[0].ty;
-            let kind = self.graph.get(inner.id).map(|def| def.kind.clone())?;
-            let mut ty = self.insert_schema_type(schema, hint, kind);
+            let mut ty = self.reemit(schema, hint, inner.id)?;
             ty.nullable = inner.nullable || nullable;
             ty.boxed = inner.boxed;
             return Some(ty);
@@ -1601,11 +1615,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             // Re-emit the intersection as the final graph insert so the invariant holds even when
             // the allOf is a component body (the per-member scalar inserts above are left dead —
             // `#[allow(dead_code)]` on the models module — rather than threading a reserved id).
-            let kind = self
-                .graph
-                .get(intersection.id)
-                .map(|def| def.kind.clone())?;
-            let mut ty = self.insert_schema_type(schema, hint, kind);
+            let mut ty = self.reemit(schema, hint, intersection.id)?;
             ty.nullable = intersection.nullable;
             return Some(self.with_all_of_nullability(schema, ty));
         }
@@ -1717,9 +1727,8 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         }
         if !scalars.is_empty() {
             // Component roots must be the final graph insert, under their original public name.
-            let kind = self.graph.get(ty.id)?.kind.clone();
             let nullable = ty.nullable;
-            ty = self.insert_schema_type(schema, hint, kind);
+            ty = self.reemit(schema, hint, ty.id)?;
             ty.nullable = nullable;
         }
         Some(self.with_all_of_nullability(schema, ty))
@@ -2051,6 +2060,43 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
     /// [`TypeKind::Null`]. Derived arrays, objects, enums, and narrowed unions are inserted into the
     /// graph so codegen still sees an ordinary, fully typed IR node.
     fn intersect_types(&mut self, a: Ty, b: Ty, hint: &str) -> Option<Ty> {
+        let before = self.graph.len();
+        let ty = self.intersect_types_inner(a, b, hint)?;
+        // An intersection must keep both sides' validation constraints, even where one side's type
+        // already accepts exactly the intersection's shape.
+        let mut required: Vec<Constraints> = Vec::new();
+        for side in [a.id, b.id] {
+            for constraints in &self.graph.get(side)?.constraints {
+                if !required.contains(constraints) {
+                    required.push(constraints.clone());
+                }
+            }
+        }
+        let current = &self.graph.get(ty.id)?.constraints;
+        let missing: Vec<Constraints> = required
+            .into_iter()
+            .filter(|constraints| !current.contains(constraints))
+            .collect();
+        if missing.is_empty() {
+            return Some(ty);
+        }
+        if (ty.id.0 as usize) >= before {
+            self.graph.get_mut(ty.id)?.constraints.extend(missing);
+            return Some(ty);
+        }
+        let definition = self.graph.get(ty.id)?.clone();
+        let copy = self.insert_type(hint, definition.kind, definition.docs, None);
+        let merged = self.graph.get_mut(copy.id)?;
+        merged.constraints = definition.constraints;
+        merged.constraints.extend(missing);
+        Some(Ty {
+            id: copy.id,
+            nullable: ty.nullable,
+            boxed: ty.boxed,
+        })
+    }
+
+    fn intersect_types_inner(&mut self, a: Ty, b: Ty, hint: &str) -> Option<Ty> {
         let a_kind = self.graph.get(a.id)?.kind.clone();
         let b_kind = self.graph.get(b.id)?.kind.clone();
         let accepts_null = type_accepts_null(a, &a_kind) && type_accepts_null(b, &b_kind);
@@ -3862,7 +3908,8 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
     }
 
     fn insert_schema_type(&mut self, schema: &Schema, hint: &str, kind: TypeKind) -> Ty {
-        self.insert_type(
+        let constraints = Self::schema_constraints(schema);
+        let ty = self.insert_type(
             hint,
             kind,
             Docs {
@@ -3872,7 +3919,50 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
                 ..Docs::default()
             },
             Some(schema.provenance.clone()),
-        )
+        );
+        if let Some(constraints) = constraints {
+            self.graph
+                .get_mut(ty.id)
+                .expect("just inserted")
+                .constraints
+                .push(constraints);
+        }
+        ty
+    }
+
+    /// Re-emit `source`'s kind and constraints as the definition of `schema` under `hint` (the final
+    /// graph insert), adding `schema`'s own constraints.
+    fn reemit(&mut self, schema: &Schema, hint: &str, source: TypeId) -> Option<Ty> {
+        let definition = self.graph.get(source)?.clone();
+        let ty = self.insert_schema_type(schema, hint, definition.kind);
+        let target = self.graph.get_mut(ty.id)?;
+        for constraints in definition.constraints {
+            if !target.constraints.contains(&constraints) {
+                target.constraints.push(constraints);
+            }
+        }
+        Some(ty)
+    }
+
+    /// The validation keywords of `schema` the IR records, if any.
+    fn schema_constraints(schema: &Schema) -> Option<Constraints> {
+        let validation = &schema.validation;
+        let constraints = Constraints {
+            pattern: validation.pattern.clone(),
+            min_length: validation.min_length,
+            max_length: validation.max_length,
+            minimum: validation.minimum,
+            maximum: validation.maximum,
+            exclusive_minimum: validation.exclusive_minimum,
+            exclusive_maximum: validation.exclusive_maximum,
+            multiple_of: validation.multiple_of,
+            min_items: validation.min_items,
+            max_items: validation.max_items,
+            unique_items: validation.unique_items,
+            min_properties: validation.min_properties,
+            max_properties: validation.max_properties,
+        };
+        (!constraints.is_empty()).then_some(constraints)
     }
 
     fn insert_type(
@@ -3888,6 +3978,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             docs,
             provenance: provenance.unwrap_or_else(|| self.document.provenance.clone()),
             positional: None,
+            constraints: Vec::new(),
         });
         Ty {
             id,
@@ -5017,7 +5108,8 @@ fn schema_imposes_scalar(schema: &Schema) -> bool {
 }
 
 fn schema_has_shape_constraint(schema: &Schema) -> bool {
-    !schema.types.types.is_empty()
+    schema.validation != crate::oas31::ValidationKeywords::default()
+        || !schema.types.types.is_empty()
         || schema_is_object_like(schema)
         || schema.items.is_some()
         || !schema.prefix_items.is_empty()
@@ -5075,6 +5167,9 @@ fn schema_is_nullable(schema: &Schema) -> bool {
             .const_value
             .as_ref()
             .is_some_and(|value| matches!(value.node, Node::Null))
+        // A `oneOf`/`anyOf` with a `null` member (the recursive `JsonValue` shape) accepts null.
+        || schema.one_of.iter().any(member_is_null_only)
+        || schema.any_of.iter().any(member_is_null_only)
 }
 
 fn scalar_value(value: &SpannedValue) -> Option<ScalarValue> {

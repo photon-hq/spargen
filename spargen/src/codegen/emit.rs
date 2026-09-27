@@ -3,7 +3,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
     AdditionalProps, Api, ApiKeyLoc, DisjointFeature, Docs, ErrorShape, Field, HttpScheme,
@@ -24,7 +24,7 @@ pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) ->
         .iter()
         .filter(|(id, _)| names.types.contains_key(id))
         .map(|(id, def)| emit_type_def(id, def, api, names, options, requests.contains(&id)));
-    let presence_helper = (!requests.is_empty()).then(|| {
+    let presence_helper = api.types.iter().any(|(_, def)| matches!(def.kind, TypeKind::Struct(_))).then(|| {
         quote! {
             // Serde's field default handles absence. For a present field, deserialize its actual
             // schema type first, preserving null only when that type permits it.
@@ -43,15 +43,37 @@ pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) ->
         quote! { use super::{Date, DateTime}; }
     });
     let const_helpers = emit_const_helpers(api, names, &requests);
+    let mut field_helpers = BTreeMap::new();
+    for (id, def) in api.types.iter() {
+        if !names.types.contains_key(&id) {
+            continue;
+        }
+        if let TypeKind::Struct(object) = &def.kind {
+            if let AdditionalProps::Typed(item) = &object.additional {
+                if let Some((helper, tokens)) = emit_overflow_helper(**item, api, names, options) {
+                    field_helpers.entry(helper.to_string()).or_insert(tokens);
+                }
+            }
+            for field in &object.fields {
+                if let Some((helper, tokens)) =
+                    emit_field_helper(field, api, names, options, requests.contains(&id))
+                {
+                    field_helpers.entry(helper.to_string()).or_insert(tokens);
+                }
+            }
+        }
+    }
+    let field_helpers = field_helpers.into_values();
     quote! {
         #[forbid(unsafe_code)]
-        #[allow(dead_code, unused_imports)]
+        #[allow(dead_code, unused_imports, clippy::deref_addrof, clippy::needless_borrow, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_call, clippy::get_first, clippy::explicit_auto_deref)]
         pub mod types {
             use serde::{Deserialize, Serialize};
             use std::collections::BTreeMap;
             #datetime_import
             #presence_helper
             #const_helpers
+            #(#field_helpers)*
 
             #(#items)*
         }
@@ -165,7 +187,7 @@ pub(crate) fn emit_client(api: &Api, names: &Names, options: &CodegenOptions) ->
         }
 
         #[forbid(unsafe_code)]
-        #[allow(dead_code, unused_mut, unused_variables, clippy::result_large_err)]
+        #[allow(dead_code, unused_mut, unused_variables, clippy::result_large_err, clippy::deref_addrof, clippy::needless_borrow, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_call, clippy::get_first, clippy::explicit_auto_deref)]
         impl Client {
             pub fn new(base_url: &str) -> Result<Self, support::Error<std::convert::Infallible>> {
                 Self::with_client(reqwest::Client::new(), base_url)
@@ -1078,7 +1100,7 @@ pub(crate) fn emit_blocking_client(
 
             #[cfg(all(feature = "blocking", not(target_arch = "wasm32")))]
             #[forbid(unsafe_code)]
-            #[allow(dead_code, unused_mut, unused_variables, clippy::result_large_err)]
+            #[allow(dead_code, unused_mut, unused_variables, clippy::result_large_err, clippy::deref_addrof, clippy::needless_borrow, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_call, clippy::get_first, clippy::explicit_auto_deref)]
             impl BlockingClient {
             /// Build a blocking client over a fresh default `reqwest::Client`.
             pub fn new(base_url: &str) -> Result<Self, support::Error<std::convert::Infallible>> {
@@ -1315,7 +1337,7 @@ fn emit_response_headers(
                 #(#fields),*
             }
 
-            #[allow(dead_code, deprecated)]
+            #[allow(dead_code, deprecated, clippy::deref_addrof, clippy::needless_borrow, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_call, clippy::get_first, clippy::explicit_auto_deref)]
             impl #ident {
                 /// Read the documented headers out of a raw header map.
                 pub fn from_headers(
@@ -2323,7 +2345,7 @@ pub(crate) fn emit_support(uses_xml: bool, uses_streams: bool, uses_time: bool) 
     // `time` mapping enabled; only then does the audit require `time` of the consumer.
     let datetime_module = uses_time.then(|| embed(&crate::support::datetime_runtime_file()));
     let datetime_reexport = uses_time.then(|| {
-        quote! { pub use datetime::{Date, DateTime}; }
+        quote! { pub use datetime::{serialize_millis, Date, DateTime}; }
     });
     // The blocking facade (`BlockingRuntime`) is embedded unconditionally but gated on the
     // `blocking` feature AND `not(target_arch = "wasm32")` at the module level: the tokio-dependent
@@ -2359,6 +2381,7 @@ pub(crate) fn emit_support(uses_xml: bool, uses_streams: bool, uses_time: bool) 
             pub use error::{Error, ProtocolError, RedirectError, RequestError, TimeoutKind, TransportError};
             pub use middleware::{Middleware, MiddlewareBackend, Next};
             pub use header::{parse_header, require_header, HeaderError, HeaderShape};
+            pub use json::{deserialize_normalized, integral};
             pub use parameter::{encode, serialize_deep_object, serialize_delimited, serialize_form, serialize_form_body, serialize_label, serialize_matrix, serialize_multipart_values, serialize_simple, Delimiter, FormMode, FormProperty, FormStyle, ParameterError, PercentEncoding};
             pub use paginate::{next_link, LinkPaginator};
             pub use response::ResponseValue;
@@ -2392,20 +2415,40 @@ fn emit_type_def(
                 .fields
                 .iter()
                 .map(|field| emit_field(id, field, api, names, options, request_model));
+
             let providers = object
                 .fields
                 .iter()
                 .filter_map(|field| emit_default_provider(id, field, names, options));
             let additional = match &object.additional {
-                AdditionalProps::Typed(ty) => {
-                    let ty = ty_tokens(**ty, names, options, false);
+                AdditionalProps::Typed(item) => {
+                    let ty = ty_tokens(**item, names, options, false);
                     let overflow = names
                         .struct_overflow
                         .get(&id)
                         .expect("overflow field name allocated");
-                    quote! { #[serde(flatten)] pub #overflow: BTreeMap<String, #ty>, }
+                    let normalized =
+                        emit_overflow_helper(**item, api, names, options).map(|(helper, _)| {
+                            let helper = helper.to_string();
+                            quote! { deserialize_with = #helper, }
+                        });
+                    quote! { #[serde(flatten, #normalized)] pub #overflow: BTreeMap<String, #ty>, }
                 }
-                AdditionalProps::Allow | AdditionalProps::Deny => quote! {},
+                // An open object keeps the members it does not declare, so they round-trip. The
+                // XML codec cannot write a flattened map, so an XML body keeps its declared shape.
+                AdditionalProps::Allow if xml_types(api).contains(&id) => quote! {},
+                AdditionalProps::Allow => {
+                    let overflow = names
+                        .struct_overflow
+                        .get(&id)
+                        .expect("overflow field name allocated");
+                    quote! {
+                        /// Members the schema does not declare, kept as received.
+                        #[serde(flatten)]
+                        pub #overflow: BTreeMap<String, serde_json::Value>,
+                    }
+                }
+                AdditionalProps::Deny => quote! {},
             };
             quote! {
                 #docs
@@ -2557,8 +2600,10 @@ fn emit_type_def(
                                     JsonCategory::Array => quote! { value.is_array() },
                                     JsonCategory::Object => quote! { value.is_object() },
                                 };
+                                let normalize = variant_normalizer(api, names, variant.ty);
                                 Some(quote! {
                                     if #predicate {
+                                        #normalize
                                         return serde_json::from_value(value)
                                             .map(#ident::#variant_ident)
                                             .map_err(serde::de::Error::custom);
@@ -2575,10 +2620,14 @@ fn emit_type_def(
                                 .variants
                                 .get(&(id, variant.name_hint.clone()))
                                 .expect("union variant name allocated");
+                            let normalize = variant_normalizer(api, names, variant.ty);
                             Some(quote! {
-                                #tag => serde_json::from_value(value)
-                                    .map(#ident::#variant_ident)
-                                    .map_err(serde::de::Error::custom),
+                                #tag => {
+                                    #normalize
+                                    serde_json::from_value(value)
+                                        .map(#ident::#variant_ident)
+                                        .map_err(serde::de::Error::custom)
+                                }
                             })
                         });
                     let ser_arms = union.variants.iter().zip(tags).map(|(variant, tag)| {
@@ -2713,8 +2762,10 @@ fn emit_type_def(
                                     quote! { value.get(#key).is_some() }
                                 }
                             };
+                            let normalize = variant_normalizer(api, names, variant.ty);
                             quote! {
                                 if #predicate {
+                                    #normalize
                                     return serde_json::from_value(value)
                                         .map(#ident::#variant_ident)
                                         .map_err(serde::de::Error::custom);
@@ -2778,8 +2829,9 @@ fn emit_type_def(
                             .get(&(id, variant.name_hint.clone()))
                             .expect("union variant name allocated");
                         let ty = union_variant_ty_tokens(variant.ty, names, options);
+                        let attempt = variant_attempt(api, names, variant.ty, &ty);
                         quote! {
-                            if let Ok(inner) = serde_json::from_value::<#ty>(value.clone()) {
+                            if let Some(inner) = #attempt {
                                 match_count += 1;
                                 let replace = match &selected {
                                     Some((selected_priority, _)) => #priority > *selected_priority,
@@ -2805,8 +2857,9 @@ fn emit_type_def(
                     });
                     let validations = union.variants.iter().map(|variant| {
                         let ty = union_variant_ty_tokens(variant.ty, names, options);
+                        let attempt = variant_attempt(api, names, variant.ty, &ty);
                         quote! {
-                            if serde_json::from_value::<#ty>(value.clone()).is_ok() {
+                            if #attempt.is_some() {
                                 match_count += 1;
                             }
                         }
@@ -2904,14 +2957,26 @@ fn emit_field(
         .xml
         .wire_override(&field.name.wire)
         .unwrap_or_else(|| field.name.wire.clone());
-    // `ty_tokens` represents nullability. In request models an independent outer `Option`
-    // represents absence: None omits the key, Some(None) sends null, Some(Some(value)) sends value.
-    // Keep the existing shape of response-only models.
+    // `ty_tokens` represents nullability; an optional member gets an independent outer `Option` for
+    // absence. Where the member is nullable (or in a request model) the two stay apart: None omits
+    // the key, Some(None) is null, Some(Some(value)) is a value, so a decoded value serializes back
+    // unchanged. An optional non-nullable member of a response-only model reads `null` as absent.
     let mut ty = ty_tokens(field.ty, names, options, false);
-    if !field.required && (request_model || !field.ty.nullable) {
+    if !field.required {
         ty = quote! { Option<#ty> };
     }
-    let presence = request_model && !field.required;
+    let presence = field_presence(field, request_model);
+    let validation = super::normalize::Normalization { api, names };
+    let normalized = !validation
+        .normalizer(
+            Ty {
+                nullable: false,
+                ..field.ty
+            },
+            quote! { value },
+            0,
+        )
+        .is_empty();
     let deserialize = if let Some(value) = names.consts.get(&field.ty.id) {
         // A string constant is a plain `String` whose value is checked in both directions, so it
         // accepts and produces exactly what the one-variant enum it replaces did. The checked
@@ -2920,9 +2985,18 @@ fn emit_field(
         let (de, ser) = const_helper_idents(names, value, presence);
         let (de, ser) = (de.to_string(), ser.to_string());
         quote! { deserialize_with = #de, serialize_with = #ser, }
-    } else if !request_model || (field.required && !field.ty.nullable) {
+    } else if normalized {
+        let (helper, _) = emit_field_helper(field, api, names, options, request_model)
+            .expect("normalized field has a helper");
+        let helper = helper.to_string();
+        quote! { deserialize_with = #helper, }
+    } else if field.required && (!field.ty.nullable || !request_model) {
         // Ordinary required types already reject absence. Avoid generating redundant serde
-        // wrappers for those fields; only Option's special missing-field behavior needs overriding.
+        // wrappers for those fields; only Option's special missing-field behavior needs overriding
+        // (a response-only model keeps reading a missing nullable member as `None`).
+        quote! {}
+    } else if !field.required && !presence {
+        // An optional non-nullable member of a response-only model: `None` is absent or null.
         quote! {}
     } else if field.required {
         // An explicit deserializer makes serde reject a missing field even when its type is Option.
@@ -2930,11 +3004,36 @@ fn emit_field(
     } else {
         quote! { deserialize_with = "deserialize_request_field", }
     };
+    // A `date-time` whose pattern demands milliseconds is written with exactly three fraction
+    // digits, alone or as the items of an array.
+    let millis = {
+        let direct = api.types.get(field.ty.id);
+        let item = match direct.map(|def| &def.kind) {
+            Some(TypeKind::Array(item)) if names.inline.contains_key(&field.ty.id) => {
+                api.types.get(item.id)
+            }
+            _ => None,
+        };
+        direct
+            .into_iter()
+            .chain(item)
+            .any(super::normalize::renders_millis)
+    };
+    let deserialize = if millis && options.feature_time {
+        quote! { #deserialize serialize_with = "super::support::serialize_millis", }
+    } else {
+        deserialize
+    };
     // An optional field always deserializes an absent value; when the spec gives a representable
     // scalar default, point serde at a generated provider so the default fills in rather than
     // `None`. Otherwise fall back to `Option::default()` (`None`).
     let serde_default = if field.required {
-        quote! {}
+        // A response-only model reads a missing nullable member as `None`, also through a helper.
+        if normalized && field.ty.nullable && !request_model {
+            quote! { default, }
+        } else {
+            quote! {}
+        }
     } else if field
         .default
         .as_ref()
@@ -2986,6 +3085,12 @@ fn emit_field(
     }
 }
 
+/// Whether an optional member keeps absence and `null` apart (`Option<Option<T>>` when nullable):
+/// always in a request model, and for a nullable member everywhere.
+fn field_presence(field: &Field, request_model: bool) -> bool {
+    !field.required && (request_model || field.ty.nullable)
+}
+
 /// The checked (de)serializer function names for a string-constant field: one generic pair per
 /// constant value (and per presence mode), shared by every field with that value.
 fn const_helper_idents(
@@ -3017,7 +3122,7 @@ fn emit_const_helpers(api: &Api, names: &Names, requests: &BTreeSet<TypeId>) -> 
         };
         for field in &object.fields {
             if let Some(value) = names.consts.get(&field.ty.id) {
-                used.insert((value.clone(), requests.contains(&id) && !field.required));
+                used.insert((value.clone(), field_presence(field, requests.contains(&id))));
             }
         }
     }
@@ -3090,6 +3195,211 @@ fn emit_const_helpers(api: &Api, names: &Names, requests: &BTreeSet<TypeId>) -> 
         #(#serializers)*
         #(#deserializers)*
     }
+}
+
+/// Statements normalizing the JSON value `value` (a `mut serde_json::Value`) for a union variant of
+/// type `ty`, returning a deserialization error from the enclosing function when it is refused.
+fn variant_normalizer(api: &Api, names: &Names, ty: Ty) -> TokenStream {
+    let validation = super::normalize::Normalization { api, names };
+    let normalize = validation.normalizer(
+        Ty {
+            nullable: false,
+            ..ty
+        },
+        quote! { value },
+        0,
+    );
+    if normalize.is_empty() {
+        return quote! {};
+    }
+    quote! {
+        let mut value = value;
+        (|value: &mut serde_json::Value| -> Result<(), String> {
+            if value.is_null() {
+                return Ok(());
+            }
+            #normalize
+            Ok(())
+        })(&mut value)
+        .map_err(serde::de::Error::custom)?;
+    }
+}
+
+/// An `Option<#rust>` expression: the buffered `value` read as a trial-union variant of type `ty`,
+/// normalized first, so a variant matches exactly when the value decodes as it.
+fn variant_attempt(api: &Api, names: &Names, ty: Ty, rust: &TokenStream) -> TokenStream {
+    let validation = super::normalize::Normalization { api, names };
+    let normalize = validation.normalizer(
+        Ty {
+            nullable: false,
+            ..ty
+        },
+        quote! { candidate },
+        0,
+    );
+    let normalize = if normalize.is_empty() {
+        quote! { let candidate = value.clone(); }
+    } else {
+        quote! {
+            let mut candidate = value.clone();
+            let normalized = (|candidate: &mut serde_json::Value| -> Result<(), String> {
+                if candidate.is_null() {
+                    return Ok(());
+                }
+                #normalize
+                Ok(())
+            })(&mut candidate);
+            if normalized.is_err() {
+                return None;
+            }
+        }
+    };
+    quote! {
+        (|| -> Option<#rust> {
+            #normalize
+            serde_json::from_value::<#rust>(candidate).ok()
+        })()
+    }
+}
+
+/// The types an XML request or response body reaches.
+fn xml_types(api: &Api) -> std::collections::HashSet<TypeId> {
+    let mut stack: Vec<TypeId> = Vec::new();
+    for operation in &api.operations {
+        if let Some(body) = operation.request_body.as_ref() {
+            if body.media == MediaType::Xml {
+                stack.extend(body.ty.map(|ty| ty.id));
+            }
+        }
+        for response in operation
+            .responses
+            .by_status
+            .iter()
+            .map(|(_, response)| response)
+            .chain(operation.responses.default.as_ref())
+        {
+            if response.media == Some(MediaType::Xml) {
+                stack.extend(response.body.map(|ty| ty.id));
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match api.types.get(id).map(|def| &def.kind) {
+            Some(TypeKind::Struct(object)) => {
+                stack.extend(object.fields.iter().map(|field| field.ty.id));
+                if let AdditionalProps::Typed(ty) = &object.additional {
+                    stack.push(ty.id);
+                }
+            }
+            Some(TypeKind::Array(ty)) => stack.push(ty.id),
+            Some(TypeKind::Tuple(items)) => stack.extend(items.iter().map(|ty| ty.id)),
+            Some(TypeKind::Union(union)) => {
+                stack.extend(union.variants.iter().map(|variant| variant.ty.id));
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// The deserializer that normalizes a field's JSON before decoding it, named by its content so equal
+/// helpers (and the models that use them) share one item.
+pub(crate) fn emit_field_helper(
+    field: &Field,
+    api: &Api,
+    names: &Names,
+    options: &CodegenOptions,
+    request_model: bool,
+) -> Option<(proc_macro2::Ident, TokenStream)> {
+    if names.consts.contains_key(&field.ty.id) {
+        return None;
+    }
+    let validation = super::normalize::Normalization { api, names };
+    let normalize = validation.normalizer(
+        Ty {
+            nullable: false,
+            ..field.ty
+        },
+        quote! { value },
+        0,
+    );
+    if normalize.is_empty() {
+        return None;
+    }
+    let ty = ty_tokens(field.ty, names, options, false);
+    let (output, inner, wrap) = if field.required {
+        (ty.clone(), ty, quote! {})
+    } else if field_presence(field, request_model) {
+        (quote! { Option<#ty> }, ty, quote! { .map(Some) })
+    } else {
+        (quote! { Option<#ty> }, quote! { Option<#ty> }, quote! {})
+    };
+    Some(normalizing_helper(output, inner, wrap, normalize))
+}
+
+/// The deserializer that normalizes the members a struct does not declare (its typed overflow map)
+/// before decoding them, named by its content like [`emit_field_helper`].
+pub(crate) fn emit_overflow_helper(
+    item: Ty,
+    api: &Api,
+    names: &Names,
+    options: &CodegenOptions,
+) -> Option<(proc_macro2::Ident, TokenStream)> {
+    let validation = super::normalize::Normalization { api, names };
+    let normalize = validation.normalizer(item, quote! { v0 }, 1);
+    if normalize.is_empty() {
+        return None;
+    }
+    let ty = ty_tokens(item, names, options, false);
+    let map = quote! { BTreeMap<String, #ty> };
+    let normalize = quote! {
+        if let serde_json::Value::Object(members) = &mut *value {
+            for v0 in members.values_mut() {
+                #normalize
+            }
+        }
+    };
+    Some(normalizing_helper(map.clone(), map, quote! {}, normalize))
+}
+
+/// A deserializer for `output` that normalizes the JSON with `normalize` (statements over
+/// `value: &mut serde_json::Value`), decodes it as `inner` and applies `wrap`.
+fn normalizing_helper(
+    output: TokenStream,
+    inner: TokenStream,
+    wrap: TokenStream,
+    normalize: TokenStream,
+) -> (proc_macro2::Ident, TokenStream) {
+    let key = {
+        let text = format!("{output}|{inner}|{wrap}|{normalize}");
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in text.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        hash
+    };
+    let helper = format_ident!("deserialize_{key:016x}");
+    let tokens = quote! {
+        fn #helper<'de, D>(deserializer: D) -> Result<#output, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            fn normalize(value: &mut serde_json::Value) -> Result<(), String> {
+                if value.is_null() {
+                    return Ok(());
+                }
+                #normalize
+                Ok(())
+            }
+            super::support::deserialize_normalized::<D, #inner>(deserializer, normalize)#wrap
+        }
+    };
+    (helper, tokens)
 }
 
 /// The deterministic identifier of a field's generated serde default-provider function. Derived
@@ -3172,7 +3482,8 @@ fn type_kind_tokens(
         }
         TypeKind::Tuple(items) => {
             let items = items.iter().map(|ty| ty_tokens(*ty, names, options, false));
-            quote! { (#(#items),*) }
+            // A trailing comma keeps a one-element tuple a tuple.
+            quote! { (#(#items,)*) }
         }
         TypeKind::Bytes => quote! { bytes::Bytes },
         TypeKind::Null => quote! { () },
@@ -3183,7 +3494,12 @@ fn type_kind_tokens(
     }
 }
 
-fn ty_tokens(ty: Ty, names: &Names, options: &CodegenOptions, qualified: bool) -> TokenStream {
+pub(crate) fn ty_tokens(
+    ty: Ty,
+    names: &Names,
+    options: &CodegenOptions,
+    qualified: bool,
+) -> TokenStream {
     let mut tokens = match names.inline.get(&ty.id) {
         Some(kind) => inline_kind_tokens(kind, names, options, qualified),
         None => {
@@ -3265,8 +3581,8 @@ fn inline_kind_tokens(
             let items = items
                 .iter()
                 .map(|ty| ty_tokens(*ty, names, options, qualified));
-            // Same spelling as a named tuple alias, so inlining never changes the Rust type.
-            quote! { (#(#items),*) }
+            // A trailing comma keeps a one-element tuple a tuple.
+            quote! { (#(#items,)*) }
         }
         TypeKind::Bytes => quote! { bytes::Bytes },
         TypeKind::Null => quote! { () },

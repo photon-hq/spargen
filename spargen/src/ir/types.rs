@@ -44,6 +44,7 @@ impl TypeGraph {
             docs: Docs::default(),
             provenance: Provenance::new(JsonPointer::root(), None),
             positional: None,
+            constraints: Vec::new(),
         })
     }
 
@@ -119,6 +120,49 @@ pub struct TypeDef {
     /// named `Variant<n>`, a tuple item named `Item<n>`, a union with two members referencing the
     /// same component), or `None`. Under `strict_names` a live, named, positional type is `E026`.
     pub positional: Option<String>,
+    /// Validation keywords a value of this type must also satisfy, beyond what its Rust type
+    /// guarantees. Every set applies (an intersection concatenates them). The client does not
+    /// enforce them; a `date-time` whose `pattern` requires milliseconds is written with them.
+    pub constraints: Vec<Constraints>,
+}
+
+/// The JSON Schema validation keywords of one schema that the Rust type cannot express, recorded
+/// for documentation and output formatting. Each applies only to values of its own JSON type.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Constraints {
+    /// `pattern`: an ECMA-262 regular expression the string must contain a match of.
+    pub pattern: Option<String>,
+    /// `minLength`, in Unicode code points.
+    pub min_length: Option<u64>,
+    /// `maxLength`, in Unicode code points.
+    pub max_length: Option<u64>,
+    /// `minimum`.
+    pub minimum: Option<f64>,
+    /// `maximum`.
+    pub maximum: Option<f64>,
+    /// `exclusiveMinimum`.
+    pub exclusive_minimum: Option<f64>,
+    /// `exclusiveMaximum`.
+    pub exclusive_maximum: Option<f64>,
+    /// `multipleOf`.
+    pub multiple_of: Option<f64>,
+    /// `minItems`.
+    pub min_items: Option<u64>,
+    /// `maxItems`.
+    pub max_items: Option<u64>,
+    /// `uniqueItems: true`.
+    pub unique_items: bool,
+    /// `minProperties`.
+    pub min_properties: Option<u64>,
+    /// `maxProperties`.
+    pub max_properties: Option<u64>,
+}
+
+impl Constraints {
+    /// Whether no keyword is set.
+    pub fn is_empty(&self) -> bool {
+        *self == Constraints::default()
+    }
 }
 
 /// A reference to a type, plus the two shape modifiers that ride on a use site rather than the

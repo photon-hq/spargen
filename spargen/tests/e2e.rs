@@ -27,7 +27,7 @@ quick-xml = {{ version = "0.41.0", features = ["serialize"] }}
 reqwest = {{ version = "0.12.28", default-features = false, features = ["json", "multipart", "stream"] }}
 secrecy = "0.10.3"
 serde = {{ version = "1.0.229", features = ["derive"] }}
-serde_json = "1.0.151"
+serde_json = {{ version = "1.0.151", features = ["float_roundtrip"] }}
 uuid = {{ version = "1.24.0", features = ["serde"] }}
 time = {{ version = "0.3.55", features = ["formatting", "parsing"] }}
 
@@ -65,7 +65,7 @@ bytes = "1.12.0"
 reqwest = {{ version = "0.12.28", default-features = false }}
 secrecy = "0.10.3"
 serde = {{ version = "1.0.229", features = ["derive"] }}
-serde_json = "1.0.151"
+serde_json = {{ version = "1.0.151", features = ["float_roundtrip"] }}
 
 [build-dependencies]
 spargen = {{ path = {spargen_path:?}, default-features = false }}
@@ -268,6 +268,38 @@ fn constant_fields_and_maps_keep_their_wire_behaviour() {
     assert!(code.contains("pub enum EventkindsItem"), "{code}");
     assert!(code.contains("The problem code."), "{code}");
     code.push_str(include_str!("fixtures/constants-runtime.rs"));
+    std::fs::write(path, code).unwrap();
+    for args in [
+        vec!["test"],
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"],
+    ] {
+        let output = Command::new("cargo")
+            .args(args)
+            .current_dir(&out)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Every value the contract allows decodes and round-trips: integral numbers, open `prefixItems`,
+/// typed open maps, presence and null, open objects and every RFC 3339 date-time spelling.
+#[test]
+fn generated_models_accept_every_value_the_contract_allows() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(&spec, include_str!("fixtures/exact-json.yaml")).unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "exact_json_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    let path = out.join("src/lib.rs");
+    let mut code = std::fs::read_to_string(&path).unwrap();
+    code.push_str(include_str!("fixtures/exact-json-runtime.rs"));
     std::fs::write(path, code).unwrap();
     for args in [
         vec!["test"],
@@ -567,6 +599,7 @@ fn every_parameter_style_serializes_onto_the_wire() {
         .deep(basic_client::types::DeepFilter {
             kind: "wide".to_owned(),
             limit: Some(3),
+            additional: Default::default(),
         })
         .reserved("a/b?c".to_owned());
     let client = basic_client::BlockingClient::new(&format!("http://{addr}")).unwrap();
@@ -627,7 +660,9 @@ fn form_urlencoded_body_bytes_follow_the_encoding_object() {
             blob: basic_client::types::DeepFilter {
                 kind: "wide".to_owned(),
                 limit: Some(3),
+                additional: Default::default(),
             },
+            additional: Default::default(),
         })
         .unwrap();
 
@@ -681,6 +716,7 @@ fn multipart_parts_carry_their_resolved_content_types() {
             caption: "a caption".to_owned(),
             count: None,
             tags: Some(vec!["x".to_owned()]),
+            additional: Default::default(),
         })
         .unwrap();
 
@@ -871,19 +907,20 @@ fn pattern_properties_capture_into_typed_overflow_map() {
 
 #[test]
 fn null_mixed_enum_field_is_option_of_enum() {
-    // The null-mixed `Priority` enum lowered to a real Rust enum used behind `Option`: an absent
-    // field and an explicit `null` both deserialize to `None`; a string value to the variant.
+    // The null-mixed `Priority` enum lowered to a real Rust enum used behind `Option`. The member
+    // is optional too, so absence and an explicit `null` stay apart: `None` is absent,
+    // `Some(None)` is `null`, and a string value is the variant.
     let absent: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n"}"#).unwrap();
     assert_eq!(absent.priority, None);
 
     let explicit_null: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n", "priority": null}"#).unwrap();
-    assert_eq!(explicit_null.priority, None);
+    assert_eq!(explicit_null.priority, Some(None));
 
     let set: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n", "priority": "high"}"#).unwrap();
-    assert_eq!(set.priority, Some(basic_client::types::Priority::High));
+    assert_eq!(set.priority, Some(Some(basic_client::types::Priority::High)));
 }
 
 #[test]
@@ -1033,7 +1070,8 @@ fn nullable_variant_union_resolves_null_at_option() {
     // bare value.
     let null: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n", "notes": null}"#).unwrap();
-    assert!(null.notes.is_none());
+    // `notes` is optional as well, so `null` is present-and-null, apart from absent.
+    assert!(matches!(null.notes, Some(None)));
 
     let text: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n", "notes": "hi"}"#).unwrap();
@@ -1115,6 +1153,7 @@ fn multipart_body_struct_has_typed_form_part_fields() {
         caption: "a caption".to_owned(),
         count: Some(3),
         tags: Some(vec!["x".to_owned(), "y".to_owned()]),
+        additional: Default::default(),
     };
     assert_eq!(&body.file[..], b"hello");
     assert_eq!(body.caption, "a caption");
@@ -1530,7 +1569,10 @@ fn oas32_constructs_reach_the_wire() {
     );
 
     let params = oas32_client::ListRecordsParams::default()
-        .filter(oas32_client::types::Query { term: Some("a b".to_owned()) })
+        .filter(oas32_client::types::Query {
+            term: Some("a b".to_owned()),
+            additional: Default::default(),
+        })
         .session("a/b".to_owned());
     let client = oas32_client::BlockingClient::new(&format!("http://{addr}")).unwrap();
     let response = client.list_records(Some(params)).unwrap();
@@ -1658,8 +1700,14 @@ fn pet_strategy() -> impl Strategy<Value = types::Pet> {
         "[a-zA-Z0-9 ]{0,16}".prop_map(|name| types::Pet::Cat(Box::new(types::Cat {
             pet_type: "cat".to_owned(),
             name,
+            additional: Default::default(),
         }))),
-        any::<bool>().prop_map(|bark| types::Pet::Dog(Box::new(types::Dog { bark }))),
+        any::<bool>().prop_map(|bark| {
+            types::Pet::Dog(Box::new(types::Dog {
+                bark,
+                additional: Default::default(),
+            }))
+        }),
     ]
 }
 
@@ -1704,7 +1752,12 @@ fn account_strategy() -> impl Strategy<Value = types::Account> {
         "[a-zA-Z0-9]{0,12}",
         proptest::option::of("[a-zA-Z0-9]{0,12}"),
     )
-        .prop_map(|(id, label, owner)| types::Account { id, label, owner })
+        .prop_map(|(id, label, owner)| types::Account {
+            id,
+            label,
+            owner,
+            additional: Default::default(),
+        })
 }
 
 proptest! {
@@ -3042,7 +3095,7 @@ bytes = "1.12.1"
 reqwest = { version = "0.12.28", default-features = false }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 
 [workspace]
 "#,
@@ -3324,7 +3377,11 @@ fn dates_are_rfc3339_on_the_wire_in_both_directions() {
     let day = dates_client::Date(
         time::Date::from_calendar_date(2023, time::Month::November, 14).unwrap(),
     );
-    let event = dates_client::types::Event { at, day };
+    let event = dates_client::types::Event {
+        at,
+        day,
+        additional: Default::default(),
+    };
 
     let params = dates_client::CreateEventParams::default()
         .since(at)
@@ -3552,6 +3609,7 @@ fn rfc6570_multipart_parts_are_not_percent_encoded() {
         tags: vec!["blue".into(), "black".into()],
         paths: vec!["a/b".into(), "c".into()],
         names: vec!["ada".into(), "grace".into()],
+        additional: Default::default(),
     };
     client.upload(&body).expect("upload round-trips");
 

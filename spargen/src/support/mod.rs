@@ -46,6 +46,10 @@ pub fn runtime_files() -> &'static [SupportFile] {
             contents: include_str!("runtime/header.rs"),
         },
         SupportFile {
+            name: "json.rs",
+            contents: include_str!("runtime/json.rs"),
+        },
+        SupportFile {
             name: "middleware.rs",
             contents: include_str!("runtime/middleware.rs"),
         },

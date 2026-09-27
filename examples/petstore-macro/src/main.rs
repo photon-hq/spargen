@@ -51,6 +51,7 @@ async fn main() {
         .create_pet(&types::NewPet {
             name: "Bella".to_owned(),
             tag: Some("dog".to_owned()),
+            additional: Default::default(),
         })
         .await
         .expect("create_pet");

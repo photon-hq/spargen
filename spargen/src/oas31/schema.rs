@@ -144,7 +144,7 @@ pub struct Discriminator {
 /// representative surface (raw applicator keywords such as `if`/`then`/`else`, `not`,
 /// `unevaluated*`, `propertyNames`, and `dependentSchemas`/`dependentRequired` are retained during
 /// implementation).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ValidationKeywords {
     pub pattern: Option<String>,
     pub minimum: Option<f64>,

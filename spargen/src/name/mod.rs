@@ -550,7 +550,10 @@ pub fn allocate(api: &Api, options: &NameOptions, diags: &mut Diagnostics) -> Na
                 // The flatten overflow field shares the struct's field scope, so it is disambiguated
                 // against any declared property (e.g. one named `additional`) instead of emitting a
                 // second literal `additional` field that would fail to compile.
-                if matches!(object.additional, AdditionalProps::Typed(_)) {
+                if matches!(
+                    object.additional,
+                    AdditionalProps::Typed(_) | AdditionalProps::Allow
+                ) {
                     names.struct_overflow.insert(
                         id,
                         scope.alloc("additional", IdentRole::Field, &def.provenance.pointer),

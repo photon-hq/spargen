@@ -86,6 +86,7 @@ async fn main() {
                 .filter(types::PetFilter {
                     name: Some("Rex".to_owned()),
                     tag: None,
+                    additional: Default::default(),
                 }),
         ))
         .await
@@ -109,6 +110,7 @@ async fn main() {
         .create_pet(&types::NewPet {
             name: "Bella".to_owned(),
             tag: Some("dog".to_owned()),
+            additional: Default::default(),
         })
         .await
         .expect("create_pet");
@@ -141,7 +143,9 @@ async fn main() {
                 meta: types::PhotoMeta {
                     caption: "Rex at the park".to_owned(),
                     width: Some(1024),
+                    additional: Default::default(),
                 },
+                additional: Default::default(),
             },
         )
         .await
