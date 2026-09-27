@@ -2286,8 +2286,8 @@ pub(crate) fn emit_params_struct(
     }
 }
 
-/// Emit an operation's multi-status success response enum, one payload-carrying variant per
-/// documented success status (empty when the operation has zero or one success body). The variant
+/// Emit an operation's multi-status success response enum, one variant per documented success
+/// status (empty unless [`crate::ir::Responses::success`] is [`SuccessShape::Enum`]). The variant
 /// is selected by HTTP status at decode time, so the enum derives only `Debug, Clone` — no
 /// whole-enum `Deserialize`, no `serde(untagged)`.
 pub(crate) fn emit_response_enum(
@@ -3250,7 +3250,7 @@ fn emit_field(
     if !field.required {
         ty = quote! { Option<#ty> };
     }
-    let presence = field_presence(field, request_model);
+    let presence = field_presence(field, api, request_model);
     let validation = super::normalize::Normalization { api, names };
     let normalized = !validation
         .normalizer(
@@ -3363,9 +3363,16 @@ fn emit_field(
 }
 
 /// Whether an optional member keeps absence and `null` apart (`Option<Option<T>>` when nullable):
-/// always in a request model, and for a nullable member everywhere.
-fn field_presence(field: &Field, request_model: bool) -> bool {
-    !field.required && (request_model || field.ty.nullable)
+/// always in a request model, and everywhere for a member whose schema admits `null` — a nullable
+/// one, or an unconstrained `{}` one, whose `serde_json::Value` holds a present `null` itself — or
+/// admits nothing at all (`false`): such a member, `null` included, is refused whenever present, so
+/// a union variant that forbids it is never chosen for a value that carries it.
+fn field_presence(field: &Field, api: &Api, request_model: bool) -> bool {
+    let null_is_a_value = matches!(
+        api.types.get(field.ty.id).map(|def| &def.kind),
+        Some(TypeKind::Any | TypeKind::Never)
+    );
+    !field.required && (request_model || field.ty.nullable || null_is_a_value)
 }
 
 /// The checked (de)serializer function names for a string-constant field: one generic pair per
@@ -3399,7 +3406,10 @@ fn emit_const_helpers(api: &Api, names: &Names, requests: &BTreeSet<TypeId>) -> 
         };
         for field in &object.fields {
             if let Some(value) = names.consts.get(&field.ty.id) {
-                used.insert((value.clone(), field_presence(field, requests.contains(&id))));
+                used.insert((
+                    value.clone(),
+                    field_presence(field, api, requests.contains(&id)),
+                ));
             }
         }
     }
@@ -3697,7 +3707,7 @@ pub(crate) fn emit_field_helper(
     let ty = ty_tokens(field.ty, names, options, false);
     let (output, inner, wrap) = if field.required {
         (ty.clone(), ty, quote! {})
-    } else if field_presence(field, request_model) {
+    } else if field_presence(field, api, request_model) {
         (quote! { Option<#ty> }, ty, quote! { .map(Some) })
     } else {
         (quote! { Option<#ty> }, quote! { Option<#ty> }, quote! {})
