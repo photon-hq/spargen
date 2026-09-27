@@ -74,7 +74,9 @@ pub use dispatch::{
 };
 pub use error::{Error, ProtocolError, RedirectError, RequestError, TimeoutKind, TransportError};
 pub use header::{parse_header, require_header, HeaderError, HeaderShape};
-pub use json::{deserialize_normalized, integral};
+pub use json::{
+    check_known_members, deserialize_normalized, integral, is_strict, retained_members, strictly,
+};
 pub use middleware::{Middleware, MiddlewareBackend, Next};
 pub use paginate::{next_link, LinkPaginator};
 pub use parameter::{

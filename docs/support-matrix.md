@@ -103,6 +103,10 @@ alter a valid value:
 * An open object (no `additionalProperties`) keeps the members it does not declare in its
   `additional` map, so a decoded value serializes back unchanged. XML bodies keep their declared
   shape, since the XML codec cannot write a flattened map.
+* A closed object (`additionalProperties: false`) ignores members it does not declare, so a
+  response carrying a member added later still decodes. A trial-matched `oneOf`/`anyOf` first
+  reads each variant exactly — undeclared members of a closed object count against it — and
+  only if no variant matches exactly takes the variant that keeps the most of the value.
 * A `date-time` accepts every RFC 3339 spelling, lower-case `t`/`z` included, and, where the
   schema's `pattern` allows it, one without seconds or from year 0000. A pattern requiring three
   fraction digits is written that way.

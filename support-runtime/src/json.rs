@@ -42,3 +42,52 @@ where
     normalize(&mut value).map_err(de::Error::custom)?;
     serde_json::from_value(value).map_err(de::Error::custom)
 }
+
+// ---- Exact matching ----------------------------------------------------------------------------
+
+thread_local! {
+    static STRICT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `read` in exact mode: members a closed object does not declare, and enum values a type does
+/// not know, fail the read instead of being ignored or kept. Trial unions read each variant this
+/// way first, so the variant the contract means is chosen.
+pub fn strictly<T>(read: impl FnOnce() -> T) -> T {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            STRICT.with(|strict| strict.set(strict.get() - 1));
+        }
+    }
+    STRICT.with(|strict| strict.set(strict.get() + 1));
+    let _leave = Leave;
+    read()
+}
+
+/// Whether a read is in exact mode (see [`strictly`]).
+pub fn is_strict() -> bool {
+    STRICT.with(|strict| strict.get() > 0)
+}
+
+/// Refuse an object member not in `known` (exact mode only; see [`strictly`]).
+pub fn check_known_members<E: de::Error>(value: &Value, known: &[&str]) -> Result<(), E> {
+    if let Value::Object(members) = value {
+        if let Some(name) = members.keys().find(|name| !known.contains(&name.as_str())) {
+            return Err(E::custom(format!("unknown member {name:?}")));
+        }
+    }
+    Ok(())
+}
+
+/// How many of `input`'s object members survive in `decoded`'s JSON: a trial union without an exact
+/// match prefers the variant that keeps the most of the value.
+pub fn retained_members<T: serde::Serialize + ?Sized>(input: &Value, decoded: &T) -> usize {
+    let (Value::Object(input), Ok(Value::Object(output))) = (input, serde_json::to_value(decoded))
+    else {
+        return 0;
+    };
+    input
+        .keys()
+        .filter(|name| output.contains_key(name.as_str()))
+        .count()
+}

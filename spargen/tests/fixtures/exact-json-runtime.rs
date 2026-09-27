@@ -89,4 +89,21 @@ mod exact_json_tests {
         input["stamp"] = json!("2024-01-01T00:00Z");
         assert!(decode(input).is_ok());
     }
+
+    #[test]
+    fn unknown_members_are_tolerated_but_still_pick_the_variant() {
+        // A closed object ignores a member it does not declare.
+        let mut input = item();
+        input["closed"] = json!({"a": "x", "later": true});
+        let decoded = decode(input).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap()["closed"], json!({"a": "x"}));
+        // Undeclared members still tell `oneOf` variants apart.
+        let pick: types::Pick = serde_json::from_value(json!({"b": "y"})).unwrap();
+        assert!(matches!(pick, types::Pick::Berry(_)));
+        let pick: types::Pick = serde_json::from_value(json!({"a": "x"})).unwrap();
+        assert!(matches!(pick, types::Pick::Apple(_)));
+        // With an addition neither variant knows, the value still decodes.
+        let pick: types::Pick = serde_json::from_value(json!({"b": "y", "later": 1})).unwrap();
+        assert!(matches!(pick, types::Pick::Berry(_)));
+    }
 }

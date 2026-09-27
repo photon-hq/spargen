@@ -2381,7 +2381,7 @@ pub(crate) fn emit_support(uses_xml: bool, uses_streams: bool, uses_time: bool) 
             pub use error::{Error, ProtocolError, RedirectError, RequestError, TimeoutKind, TransportError};
             pub use middleware::{Middleware, MiddlewareBackend, Next};
             pub use header::{parse_header, require_header, HeaderError, HeaderShape};
-            pub use json::{deserialize_normalized, integral};
+            pub use json::{check_known_members, deserialize_normalized, integral, is_strict, retained_members, strictly};
             pub use parameter::{encode, serialize_deep_object, serialize_delimited, serialize_form, serialize_form_body, serialize_label, serialize_matrix, serialize_multipart_values, serialize_simple, Delimiter, FormMode, FormProperty, FormStyle, ParameterError, PercentEncoding};
             pub use paginate::{next_link, LinkPaginator};
             pub use response::ResponseValue;
@@ -2409,8 +2409,42 @@ fn emit_type_def(
     let deprecated = def.docs.deprecated.then(|| quote! { #[deprecated] });
     match &def.kind {
         TypeKind::Struct(object) => {
-            let deny_unknown = matches!(object.additional, AdditionalProps::Deny)
-                .then(|| quote! { #[serde(deny_unknown_fields)] });
+            // A closed object (`additionalProperties: false`) still ignores members it does not
+            // declare, so a response carrying a member added later decodes; only a trial union's
+            // exact pass (`support::strictly`) counts them against the object.
+            let closed = matches!(object.additional, AdditionalProps::Deny).then(|| {
+                let known = object.fields.iter().map(|field| field.name.wire.as_str());
+                quote! {
+                    impl<'de> serde::Deserialize<'de> for #ident {
+                        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                        where
+                            D: serde::Deserializer<'de>,
+                        {
+                            if super::support::is_strict() {
+                                let value = serde_json::Value::deserialize(deserializer)?;
+                                super::support::check_known_members::<D::Error>(
+                                    &value,
+                                    &[#(#known),*],
+                                )?;
+                                #ident::deserialize(value).map_err(serde::de::Error::custom)
+                            } else {
+                                #ident::deserialize(deserializer)
+                            }
+                        }
+                    }
+                    impl serde::Serialize for #ident {
+                        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                        where
+                            S: serde::Serializer,
+                        {
+                            #ident::serialize(self, serializer)
+                        }
+                    }
+                }
+            });
+            let remote = closed
+                .is_some()
+                .then(|| quote! { #[serde(remote = "Self")] });
             let fields = object
                 .fields
                 .iter()
@@ -2454,11 +2488,12 @@ fn emit_type_def(
                 #docs
                 #deprecated
                 #[derive(Debug, Clone, Serialize, Deserialize)]
-                #deny_unknown
+                #remote
                 pub struct #ident {
                     #(#fields)*
                     #additional
                 }
+                #closed
                 #(#providers)*
             }
         }
@@ -2822,28 +2857,39 @@ fn emit_type_def(
                         let ty = union_variant_ty_tokens(variant.ty, names, options);
                         quote! { #variant_ident(#ty), }
                     });
-                    let attempts = union.variants.iter().zip(priorities).map(
-                    |(variant, priority)| {
-                        let variant_ident = names
+                    let attempts =
+                        union
                             .variants
-                            .get(&(id, variant.name_hint.clone()))
-                            .expect("union variant name allocated");
-                        let ty = union_variant_ty_tokens(variant.ty, names, options);
-                        let attempt = variant_attempt(api, names, variant.ty, &ty);
-                        quote! {
-                            if let Some(inner) = #attempt {
-                                match_count += 1;
-                                let replace = match &selected {
-                                    Some((selected_priority, _)) => #priority > *selected_priority,
-                                    None => true,
-                                };
-                                if replace {
-                                    selected = Some((#priority, #ident::#variant_ident(inner)));
+                            .iter()
+                            .zip(priorities)
+                            .map(|(variant, priority)| {
+                                let variant_ident = names
+                                    .variants
+                                    .get(&(id, variant.name_hint.clone()))
+                                    .expect("union variant name allocated");
+                                let ty = union_variant_ty_tokens(variant.ty, names, options);
+                                let attempt = variant_attempt(api, names, variant.ty, &ty);
+                                quote! {
+                                    if let Some(inner) = #attempt {
+                                        match_count += 1;
+                                        // Without an exact match, prefer the variant that keeps the most
+                                        // of the value's members.
+                                        let retained = if strict {
+                                            0
+                                        } else {
+                                            super::support::retained_members(&value, &inner)
+                                        };
+                                        let rank = (retained, #priority);
+                                        let replace = match &selected {
+                                            Some((selected_rank, _)) => rank > *selected_rank,
+                                            None => true,
+                                        };
+                                        if replace {
+                                            selected = Some((rank, #ident::#variant_ident(inner)));
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                    },
-                );
+                            });
                     let ser_arms = union.variants.iter().map(|variant| {
                         let variant_ident = names
                             .variants
@@ -2887,8 +2933,15 @@ fn emit_type_def(
                                 let value = match self {
                                     #(#ser_arms),*
                                 };
-                                let mut match_count = 0_usize;
-                                #(#validations)*
+                                let count = |strict: bool| -> usize {
+                                    let mut match_count = 0_usize;
+                                    #(#validations)*
+                                    match_count
+                                };
+                                let mut match_count = count(true);
+                                if match_count == 0 && !super::support::is_strict() {
+                                    match_count = count(false).min(1);
+                                }
                                 if #ser_valid {
                                     value.serialize(serializer)
                                 } else {
@@ -2912,9 +2965,24 @@ fn emit_type_def(
                             {
                                 let value = serde_json::Value::deserialize(deserializer)?;
                                 #(#constraint_checks)*
-                                let mut match_count = 0_usize;
-                                let mut selected: Option<(u32, Self)> = None;
-                                #(#attempts)*
+                                // The chosen variant, ranked by (members kept, priority).
+                                type Selected = Option<((usize, u32), #ident)>;
+                                let pass = |strict: bool| -> (usize, Selected) {
+                                    let mut match_count = 0_usize;
+                                    let mut selected: Selected = None;
+                                    #(#attempts)*
+                                    (match_count, selected)
+                                };
+                                // An exact pass first, where members and enum values a variant
+                                // does not know count against it; if no variant matches exactly,
+                                // the best variant that reads the value, so a response carrying
+                                // additions still decodes.
+                                let (mut match_count, mut selected) = pass(true);
+                                if match_count == 0 && !super::support::is_strict() {
+                                    let (count, lenient) = pass(false);
+                                    match_count = count.min(1);
+                                    selected = lenient;
+                                }
                                 if #de_valid {
                                     selected
                                         .map(|(_, value)| value)
@@ -3226,7 +3294,8 @@ fn variant_normalizer(api: &Api, names: &Names, ty: Ty) -> TokenStream {
 }
 
 /// An `Option<#rust>` expression: the buffered `value` read as a trial-union variant of type `ty`,
-/// normalized first, so a variant matches exactly when the value decodes as it.
+/// normalized first, so a variant matches exactly when the value decodes as it. With `strict` (a
+/// `bool` in scope) true, members and enum values the variant does not know count against it.
 fn variant_attempt(api: &Api, names: &Names, ty: Ty, rust: &TokenStream) -> TokenStream {
     let validation = super::normalize::Normalization { api, names };
     let normalize = validation.normalizer(
@@ -3257,7 +3326,11 @@ fn variant_attempt(api: &Api, names: &Names, ty: Ty, rust: &TokenStream) -> Toke
     quote! {
         (|| -> Option<#rust> {
             #normalize
-            serde_json::from_value::<#rust>(candidate).ok()
+            if strict {
+                super::support::strictly(|| serde_json::from_value::<#rust>(candidate)).ok()
+            } else {
+                serde_json::from_value::<#rust>(candidate).ok()
+            }
         })()
     }
 }
