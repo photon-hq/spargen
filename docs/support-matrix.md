@@ -119,6 +119,9 @@ alter a valid value:
 * An open `prefixItems` array (no `items: false`) is a `Vec<serde_json::Value>`, so it may be
   shorter than the prefix or hold more items; `items: false` stays a Rust tuple.
 * A `oneOf`/`anyOf` with a `null` member (the recursive `JsonValue` shape) accepts `null`.
+* A `oneOf`/`anyOf` whose members are all the same scalar type, told apart only by
+  validation-only keywords (string members that differ in `pattern`, say), is that scalar under
+  the union's own name and description; as an enum, every value would match every member.
 * A component name that is already a Rust type name keeps its exact spelling (`OAuthClient`).
 
 Generated output requires `serde_json`'s `float_roundtrip` feature, so numbers are read exactly.

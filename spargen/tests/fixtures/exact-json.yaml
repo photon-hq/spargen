@@ -82,6 +82,12 @@ components:
           properties:
             cap: { type: integer }
           additionalProperties: { type: integer, maximum: 10 }
+        address: { $ref: '#/components/schemas/Mailbox' }
+        code:
+          anyOf:
+            - { type: integer, minimum: 0 }
+            - { type: integer, maximum: -10 }
+            - { type: 'null' }
     Summary:
       type: object
       required: [id, flag]
@@ -138,3 +144,11 @@ components:
     Tier:
       type: string
       enum: [gold, silver]
+    Mailbox:
+      description: A mailbox address.
+      type: string
+      minLength: 1
+      pattern: '^[^\s@]+@[^\s@]+$'
+      oneOf:
+        - { type: string }
+        - { type: string, pattern: '\s' }

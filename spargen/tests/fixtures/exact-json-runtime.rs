@@ -122,6 +122,21 @@ mod exact_json_tests {
     }
 
     #[test]
+    fn unions_told_apart_only_by_validation_keywords_are_their_scalar() {
+        // Mailbox's `oneOf` string branches differ only in `pattern`, so it is a plain string
+        // rather than an enum whose every value matches both branches.
+        let address: types::Mailbox = String::from("a@b.example");
+        accepts("address", json!(address));
+        accepts("address", json!("not checked by the client"));
+        // Likewise integer branches that differ only in bounds, with `null` kept.
+        let mut input = item();
+        input["code"] = json!(-3);
+        assert_eq!(decode(input).unwrap().code, Some(Some(-3)));
+        accepts("code", json!(12));
+        accepts("code", Value::Null);
+    }
+
+    #[test]
     fn enums_a_response_union_constraint_carries_are_open() {
         // Tier is also a request parameter, but a Graded response checks it through its
         // constraint, so a tier added later still decodes.

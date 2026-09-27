@@ -1140,6 +1140,10 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             ty.boxed = inner.boxed;
             return Some(ty);
         }
+        if let Some(mut ty) = self.collapse_scalar_union(schema, hint, &variants) {
+            ty.nullable = nullable;
+            return Some(ty);
+        }
 
         let strategy = if let Some(discriminator) = &schema.discriminator {
             // A `defaultMapping` that names a schema outside this union describes a fallback
@@ -1186,6 +1190,59 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
             );
         }
         ty.nullable = nullable;
+        Some(ty)
+    }
+
+    /// Collapse a union whose variants are all the same primitive, such as string branches told
+    /// apart only by `pattern`, into that primitive under the union's own name and docs.
+    ///
+    /// Such variants differ only in validation keywords, which the client leaves to the service, so
+    /// every value would match every variant: `oneOf` would reject each one as ambiguous and `anyOf`
+    /// would always pick the first. Every value the union allows is a value of the primitive, so
+    /// the primitive accepts all of them. Only the validation keywords every variant shares carry
+    /// over; a keyword of one variant is an alternative, not a requirement. Variants with the same
+    /// validation keywords are not told apart by the contract either, so they stay a union.
+    fn collapse_scalar_union(
+        &mut self,
+        schema: &Schema,
+        hint: &str,
+        variants: &[UnionVariant],
+    ) -> Option<Ty> {
+        let defs: Vec<&TypeDef> = variants
+            .iter()
+            .map(|variant| self.graph.get(variant.ty.id))
+            .collect::<Option<_>>()?;
+        let TypeKind::Primitive(prim) = defs.first()?.kind else {
+            return None;
+        };
+        let same_constraints = |a: &TypeDef, b: &TypeDef| {
+            a.constraints.len() == b.constraints.len()
+                && a.constraints.iter().all(|c| b.constraints.contains(c))
+        };
+        if !defs
+            .iter()
+            .all(|def| matches!(def.kind, TypeKind::Primitive(other) if other == prim))
+            || defs.iter().all(|def| same_constraints(def, defs[0]))
+        {
+            return None;
+        }
+        let shared: Vec<Constraints> = defs[0]
+            .constraints
+            .iter()
+            .filter(|constraints| {
+                defs[1..]
+                    .iter()
+                    .all(|def| def.constraints.contains(constraints))
+            })
+            .cloned()
+            .collect();
+        let ty = self.insert_schema_type(schema, hint, TypeKind::Primitive(prim));
+        let target = self.graph.get_mut(ty.id)?;
+        for constraints in shared {
+            if !target.constraints.contains(&constraints) {
+                target.constraints.push(constraints);
+            }
+        }
         Some(ty)
     }
 
