@@ -7,6 +7,9 @@ paths:
       parameters:
         - { name: groupBy, in: query, required: true, schema: { type: string, const: day } }
         - { name: interval, in: query, schema: { type: string, enum: [hour] } }
+        # An optional nullable constant is compared once its field is unwrapped, in both spellings.
+        - { name: unit, in: query, schema: { type: [string, 'null'], const: seconds } }
+        - { name: zone, in: query, schema: { type: [string, 'null'], enum: [utc] } }
       responses:
         '200':
           description: One active pet

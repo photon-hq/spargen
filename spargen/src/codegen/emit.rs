@@ -358,31 +358,34 @@ pub(crate) fn emit_operation(
         .filter_map(|param| {
             let value = names.consts.get(&param.ty.id)?;
             let message = format!("parameter `{}` must be the constant {value:?}", param.name);
-            let check = |binding: TokenStream| {
-                if param.ty.nullable {
-                    quote! {
-                        if #binding.as_deref().is_some_and(|value| value != #value) {
-                            return Err(support::Error::request_message(#message));
-                        }
-                    }
-                } else {
-                    quote! {
-                        if #binding != #value {
-                            return Err(support::Error::request_message(#message));
-                        }
+            let refuse_other = |binding: TokenStream| {
+                quote! {
+                    if #binding != #value {
+                        return Err(support::Error::request_message(#message));
                     }
                 }
             };
             if param.required {
                 let ident = param_ident(param, crate::name::IdentRole::Param);
-                Some(check(quote! { #ident }))
+                if param.ty.nullable {
+                    Some(quote! {
+                        if #ident.as_deref().is_some_and(|value| value != #value) {
+                            return Err(support::Error::request_message(#message));
+                        }
+                    })
+                } else {
+                    Some(refuse_other(quote! { #ident }))
+                }
             } else {
                 let ident = param_ident(param, crate::name::IdentRole::Field);
                 let params_binding = bindings
                     .params
                     .as_ref()
                     .expect("optional parameters argument allocated");
-                let inner = check(quote! { value });
+                // An optional parameter's field is a single `Option<String>` whether or not it is
+                // nullable (absent and `null` both collapse to `None`), so the value bound below is
+                // already a plain `&String`.
+                let inner = refuse_other(quote! { value });
                 Some(quote! {
                     if let Some(value) = #params_binding
                         .as_ref()

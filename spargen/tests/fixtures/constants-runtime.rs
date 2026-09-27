@@ -134,4 +134,47 @@ mod constant_tests {
             }
         }
     }
+
+    #[derive(Debug, Default)]
+    struct CaptureQuery(std::sync::Mutex<Option<String>>);
+
+    impl super::HttpBackend for CaptureQuery {
+        fn execute(&self, request: reqwest::Request) -> super::ExecuteFuture<'_> {
+            *self.0.lock().unwrap() = request.url().query().map(ToOwned::to_owned);
+            // Stop at the transport boundary: no socket, service or asynchronous runtime needed.
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[test]
+    fn optional_nullable_constant_parameters_send_only_the_constant() {
+        use std::future::Future;
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Waker};
+        let params = super::ListActivePetsParams::default;
+        for (params, sent) in [
+            (params(), Some("groupBy=day")),
+            (
+                params().unit("seconds".to_owned()).zone("utc".to_owned()),
+                Some("groupBy=day&unit=seconds&zone=utc"),
+            ),
+            (params().unit("minutes".to_owned()), None),
+            (params().zone("local".to_owned()), None),
+        ] {
+            let backend = Arc::new(CaptureQuery::default());
+            let client = super::Client::with_backend(backend.clone(), "https://example.test").unwrap();
+            let mut call = std::pin::pin!(client.list_active_pets("day".to_owned(), Some(params)));
+            let polled = call.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            match sent {
+                Some(query) => {
+                    assert!(polled.is_pending());
+                    assert_eq!(backend.0.lock().unwrap().as_deref(), Some(query));
+                }
+                None => {
+                    assert!(matches!(polled, Poll::Ready(Err(_))));
+                    assert_eq!(*backend.0.lock().unwrap(), None);
+                }
+            }
+        }
+    }
 }
