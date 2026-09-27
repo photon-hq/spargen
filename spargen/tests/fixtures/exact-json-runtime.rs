@@ -106,4 +106,18 @@ mod exact_json_tests {
         let pick: types::Pick = serde_json::from_value(json!({"b": "y", "later": 1})).unwrap();
         assert!(matches!(pick, types::Pick::Berry(_)));
     }
+
+    #[test]
+    fn response_enums_are_open() {
+        let summary: types::Summary =
+            serde_json::from_value(json!({"id": "a", "flag": null, "state": "archived"})).unwrap();
+        assert_eq!(summary.state, Some(types::State::Unknown2("archived".to_owned())));
+        assert_eq!(serde_json::to_value(&summary).unwrap()["state"], "archived");
+        let summary: types::Summary =
+            serde_json::from_value(json!({"id": "a", "flag": null, "state": "unknown"})).unwrap();
+        assert_eq!(summary.state, Some(types::State::Unknown));
+        assert_eq!(types::State::Open.to_string(), "open");
+        // A request-only enum lists exactly the contract's values.
+        assert!(serde_json::from_value::<types::Order>(json!("random")).is_err());
+    }
 }

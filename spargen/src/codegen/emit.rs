@@ -17,13 +17,24 @@ use super::CodegenOptions;
 /// Emit the `types` (models) module for every type in the graph, in deterministic order.
 pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) -> TokenStream {
     let requests = request_model_types(api);
+    let closed_enums = request_only_types(api);
     // Only named types get an item. Inline types are spelled out where they are used, and a type
     // with no name at all is a lowering by-product nothing in the API reaches.
     let items = api
         .types
         .iter()
         .filter(|(id, _)| names.types.contains_key(id))
-        .map(|(id, def)| emit_type_def(id, def, api, names, options, requests.contains(&id)));
+        .map(|(id, def)| {
+            emit_type_def(
+                id,
+                def,
+                api,
+                names,
+                options,
+                requests.contains(&id),
+                !closed_enums.contains(&id),
+            )
+        });
     let presence_helper = api.types.iter().any(|(_, def)| matches!(def.kind, TypeKind::Struct(_))).then(|| {
         quote! {
             // Serde's field default handles absence. For a present field, deserialize its actual
@@ -109,6 +120,69 @@ fn request_model_types(api: &Api) -> BTreeSet<TypeId> {
         }
     }
     seen
+}
+
+/// The types reached from the given roots through fields, overflow maps, items and variants.
+fn reachable_types(roots: impl IntoIterator<Item = TypeId>, api: &Api) -> BTreeSet<TypeId> {
+    let mut pending: Vec<TypeId> = roots.into_iter().collect();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match api.types.get(id).map(|def| &def.kind) {
+            Some(TypeKind::Struct(object)) => {
+                pending.extend(object.fields.iter().map(|field| field.ty.id));
+                if let AdditionalProps::Typed(ty) = &object.additional {
+                    pending.push(ty.id);
+                }
+            }
+            Some(TypeKind::Array(ty)) => pending.push(ty.id),
+            Some(TypeKind::Tuple(items)) => pending.extend(items.iter().map(|ty| ty.id)),
+            Some(TypeKind::Union(union)) => {
+                pending.extend(union.variants.iter().map(|variant| variant.ty.id));
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// The types only requests use (bodies and parameters), never a response body or header. Their
+/// string enums stay closed: a client sends only the values the contract lists. Every other string
+/// enum of two or more values is open, so a value the server adds later still decodes.
+fn request_only_types(api: &Api) -> BTreeSet<TypeId> {
+    let requests = reachable_types(
+        api.operations.iter().flat_map(|operation| {
+            let body = operation
+                .request_body
+                .as_ref()
+                .and_then(|body| body.ty.map(|ty| ty.id));
+            body.into_iter()
+                .chain(operation.params.iter().map(|param| param.ty.id))
+        }),
+        api,
+    );
+    let responses = reachable_types(
+        api.operations.iter().flat_map(|operation| {
+            operation
+                .responses
+                .by_status
+                .iter()
+                .map(|(_, response)| response)
+                .chain(operation.responses.default.as_ref())
+                .flat_map(|response| {
+                    response
+                        .body
+                        .map(|ty| ty.id)
+                        .into_iter()
+                        .chain(response.headers.iter().map(|header| header.ty.id))
+                })
+                .collect::<Vec<_>>()
+        }),
+        api,
+    );
+    requests.difference(&responses).copied().collect()
 }
 
 /// The declared security schemes, rendered as rustdoc for `with_credential`.
@@ -2403,6 +2477,7 @@ fn emit_type_def(
     names: &Names,
     options: &CodegenOptions,
     request_model: bool,
+    open_enum: bool,
 ) -> TokenStream {
     let ident = names.types.get(&id).expect("type name allocated");
     let docs = doc_tokens(&def.docs);
@@ -2498,41 +2573,122 @@ fn emit_type_def(
             }
         }
         TypeKind::Enum(enumeration) if enumeration.repr == ScalarRepr::String => {
-            let variants = enumeration.variants.iter().map(|variant| {
-                let value = match variant {
-                    ScalarValue::String(value) => value,
-                    _ => unreachable!("string repr has string variants"),
-                };
-                let ident = names
-                    .variants
-                    .get(&(id, value.clone()))
-                    .expect("variant name allocated");
-                quote! { #[serde(rename = #value)] #ident, }
-            });
-            let display_arms = enumeration.variants.iter().map(|variant| {
-                let value = match variant {
-                    ScalarValue::String(value) => value,
-                    _ => unreachable!("string repr has string variants"),
-                };
-                let variant_ident = names
-                    .variants
-                    .get(&(id, value.clone()))
-                    .expect("variant name allocated");
+            let values: Vec<(&String, &crate::name::Ident)> = enumeration
+                .variants
+                .iter()
+                .map(|variant| {
+                    let value = match variant {
+                        ScalarValue::String(value) => value,
+                        _ => unreachable!("string repr has string variants"),
+                    };
+                    let variant_ident = names
+                        .variants
+                        .get(&(id, value.clone()))
+                        .expect("variant name allocated");
+                    (value, variant_ident)
+                })
+                .collect();
+            let display_arms = values.iter().map(|(value, variant_ident)| {
                 quote! { #ident::#variant_ident => #value, }
             });
+            // A one-value enum is a constant: it stays exactly that value, as constant fields do.
+            if !open_enum || values.len() == 1 {
+                let variants = values.iter().map(|(value, variant_ident)| {
+                    quote! { #[serde(rename = #value)] #variant_ident, }
+                });
+                return quote! {
+                    #docs
+                    #deprecated
+                    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+                    #[non_exhaustive]
+                    pub enum #ident {
+                        #(#variants)*
+                    }
+
+                    impl std::fmt::Display for #ident {
+                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            f.write_str(match self {
+                                #(#display_arms)*
+                            })
+                        }
+                    }
+                };
+            }
+            // An open enum: the values the contract lists, plus one holding any other string, so a
+            // value the server adds later decodes and serializes back unchanged.
+            let unknown = unknown_variant_ident(values.iter().map(|(_, ident)| ident.as_str()));
+            let variants = values.iter().map(|(value, variant_ident)| {
+                let doc = format!("`{value}`");
+                quote! { #[doc = #doc] #variant_ident, }
+            });
+            // `Self`, not the type's name, so equal enums stay equal item for item.
+            let parse_arms = values.iter().map(|(value, variant_ident)| {
+                quote! { #value => Ok(Self::#variant_ident), }
+            });
+            let str_arms = values.iter().map(|(value, variant_ident)| {
+                quote! { Self::#variant_ident => #value, }
+            });
+            let known: Vec<&String> = values.iter().map(|(value, _)| *value).collect();
+            let expected = format!(
+                "one of {}",
+                known
+                    .iter()
+                    .map(|value| format!("`{value}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             quote! {
                 #docs
                 #deprecated
-                #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+                #[derive(Debug, Clone, PartialEq, Eq)]
+                #[non_exhaustive]
                 pub enum #ident {
                     #(#variants)*
+                    /// A value this version of the client does not know, kept as received.
+                    #unknown(String),
+                }
+
+                impl #ident {
+                    /// The value as it appears on the wire.
+                    pub fn as_str(&self) -> &str {
+                        match self {
+                            #(#str_arms)*
+                            Self::#unknown(value) => value,
+                        }
+                    }
                 }
 
                 impl std::fmt::Display for #ident {
                     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        f.write_str(match self {
-                            #(#display_arms)*
-                        })
+                        f.write_str(self.as_str())
+                    }
+                }
+
+                impl serde::Serialize for #ident {
+                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                    where
+                        S: serde::Serializer,
+                    {
+                        serializer.serialize_str(self.as_str())
+                    }
+                }
+
+                impl<'de> serde::Deserialize<'de> for #ident {
+                    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                    where
+                        D: serde::Deserializer<'de>,
+                    {
+                        let value = String::deserialize(deserializer)?;
+                        match value.as_str() {
+                            #(#parse_arms)*
+                            // A trial union's exact pass counts an unlisted value against the
+                            // variant.
+                            _ if super::support::is_strict() => Err(serde::de::Error::invalid_value(
+                                serde::de::Unexpected::Str(&value),
+                                &#expected,
+                            )),
+                            _ => Ok(Self::#unknown(value)),
+                        }
                     }
                 }
             }
@@ -3333,6 +3489,17 @@ fn variant_attempt(api: &Api, names: &Names, ty: Ty, rust: &TokenStream) -> Toke
             }
         })()
     }
+}
+
+/// The variant holding an unlisted value of an open enum: `Unknown`, or the first free
+/// `Unknown<n>` when the contract already lists a value named that way.
+fn unknown_variant_ident<'a>(taken: impl Iterator<Item = &'a str>) -> proc_macro2::Ident {
+    let taken: BTreeSet<&str> = taken.collect();
+    let name = std::iter::once("Unknown".to_owned())
+        .chain((2..).map(|index| format!("Unknown{index}")))
+        .find(|name| !taken.contains(name.as_str()))
+        .expect("a free name");
+    format_ident!("{}", name)
 }
 
 /// The types an XML request or response body reaches.

@@ -7,6 +7,7 @@ paths:
       parameters:
         - { name: label, in: query, schema: { type: string, pattern: '^\S+$' } }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10 } }
+        - { name: order, in: query, schema: { $ref: '#/components/schemas/Order' } }
       requestBody:
         required: true
         content:
@@ -77,6 +78,7 @@ components:
         note: { type: string }
         flag: { type: [string, 'null'] }
         count: { type: integer }
+        state: { $ref: '#/components/schemas/State' }
     Pick:
       oneOf:
         - { $ref: '#/components/schemas/Apple' }
@@ -91,3 +93,9 @@ components:
       additionalProperties: false
       properties:
         b: { type: string }
+    State:
+      type: string
+      enum: [open, closed, unknown]
+    Order:
+      type: string
+      enum: [asc, desc]

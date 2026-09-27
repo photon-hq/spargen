@@ -107,6 +107,12 @@ alter a valid value:
   response carrying a member added later still decodes. A trial-matched `oneOf`/`anyOf` first
   reads each variant exactly — undeclared members of a closed object count against it — and
   only if no variant matches exactly takes the variant that keeps the most of the value.
+* A string enum of two or more values that a response can carry is open: besides the listed
+  values it has an `Unknown(String)` variant (`Unknown<n>` if the contract lists a value named
+  `Unknown`) holding any other string, which serializes back unchanged; `as_str` gives the wire
+  value. An enum only requests use lists exactly the contract's values. Every generated string
+  enum is `#[non_exhaustive]`. A trial union's exact pass counts an unlisted value against a
+  variant.
 * A `date-time` accepts every RFC 3339 spelling, lower-case `t`/`z` included, and, where the
   schema's `pattern` allows it, one without seconds or from year 0000. A pattern requiring three
   fraction digits is written that way.
