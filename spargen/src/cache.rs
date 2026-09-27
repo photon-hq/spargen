@@ -61,6 +61,7 @@ impl InputSnapshot {
         );
         append(&mut fingerprint, &(spec.batch_cap as u64).to_be_bytes());
         append(&mut fingerprint, &[u8::from(spec.carve)]);
+        append(&mut fingerprint, &[u8::from(spec.strict_names)]);
         for rule in &spec.omit.rules {
             match rule {
                 OmitRule::Path { path } => {

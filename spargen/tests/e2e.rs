@@ -27,7 +27,7 @@ quick-xml = {{ version = "0.41.0", features = ["serialize"] }}
 reqwest = {{ version = "0.12.28", default-features = false, features = ["json", "multipart", "stream"] }}
 secrecy = "0.10.3"
 serde = {{ version = "1.0.229", features = ["derive"] }}
-serde_json = "1.0.151"
+serde_json = {{ version = "1.0.151", features = ["float_roundtrip"] }}
 uuid = {{ version = "1.24.0", features = ["serde"] }}
 time = {{ version = "0.3.55", features = ["formatting", "parsing"] }}
 
@@ -65,7 +65,7 @@ bytes = "1.12.0"
 reqwest = {{ version = "0.12.28", default-features = false }}
 secrecy = "0.10.3"
 serde = {{ version = "1.0.229", features = ["derive"] }}
-serde_json = "1.0.151"
+serde_json = {{ version = "1.0.151", features = ["float_roundtrip"] }}
 
 [build-dependencies]
 spargen = {{ path = {spargen_path:?}, default-features = false }}
@@ -226,6 +226,80 @@ fn request_field_presence_compiles_and_round_trips() {
     assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
     assert_eq!(code, std::fs::read_to_string(repeat).unwrap());
     code.push_str(include_str!("fixtures/request-presence-runtime.rs"));
+    std::fs::write(path, code).unwrap();
+    for args in [
+        vec!["test"],
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"],
+    ] {
+        let output = Command::new("cargo")
+            .args(args)
+            .current_dir(&out)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// String constants become checked `String` fields and map-only objects become maps. Both must
+/// keep the exact wire behaviour of the one-variant enum and wrapper struct they replace: the same
+/// accepted values, requiredness, nullability and defaults, and nothing else ever serialized.
+#[test]
+fn constant_fields_and_maps_keep_their_wire_behaviour() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(&spec, include_str!("fixtures/constants.yaml")).unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "constants_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    let path = out.join("src/lib.rs");
+    let mut code = std::fs::read_to_string(&path).unwrap();
+    assert!(code.contains("pub r#type: String,"), "{code}");
+    assert!(
+        code.contains("pub labels: Option<std::collections::BTreeMap<String, String>>"),
+        "{code}"
+    );
+    assert!(!code.contains("pub struct Eventlabels"), "{code}");
+    assert!(!code.contains("pub enum NotFoundProblemcode"), "{code}");
+    assert!(code.contains("pub enum EventkindsItem"), "{code}");
+    assert!(code.contains("The problem code."), "{code}");
+    code.push_str(include_str!("fixtures/constants-runtime.rs"));
+    std::fs::write(path, code).unwrap();
+    for args in [
+        vec!["test"],
+        vec!["clippy", "--all-targets", "--", "-D", "warnings"],
+    ] {
+        let output = Command::new("cargo")
+            .args(args)
+            .current_dir(&out)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Every value the contract allows decodes and round-trips: integral numbers, open `prefixItems`,
+/// typed open maps, presence and null, open objects and every RFC 3339 date-time spelling.
+#[test]
+fn generated_models_accept_every_value_the_contract_allows() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(&spec, include_str!("fixtures/exact-json.yaml")).unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "exact_json_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    let path = out.join("src/lib.rs");
+    let mut code = std::fs::read_to_string(&path).unwrap();
+    code.push_str(include_str!("fixtures/exact-json-runtime.rs"));
     std::fs::write(path, code).unwrap();
     for args in [
         vec!["test"],
@@ -525,6 +599,7 @@ fn every_parameter_style_serializes_onto_the_wire() {
         .deep(basic_client::types::DeepFilter {
             kind: "wide".to_owned(),
             limit: Some(3),
+            additional: Default::default(),
         })
         .reserved("a/b?c".to_owned());
     let client = basic_client::BlockingClient::new(&format!("http://{addr}")).unwrap();
@@ -585,7 +660,9 @@ fn form_urlencoded_body_bytes_follow_the_encoding_object() {
             blob: basic_client::types::DeepFilter {
                 kind: "wide".to_owned(),
                 limit: Some(3),
+                additional: Default::default(),
             },
+            additional: Default::default(),
         })
         .unwrap();
 
@@ -639,6 +716,7 @@ fn multipart_parts_carry_their_resolved_content_types() {
             caption: "a caption".to_owned(),
             count: None,
             tags: Some(vec!["x".to_owned()]),
+            additional: Default::default(),
         })
         .unwrap();
 
@@ -798,22 +876,26 @@ fn multi_status_dispatch_uses_each_status_media_codec() {
     )
     .unwrap();
 
-    // Prove the wired serde defaults actually deserialize: an absent optional field with a
-    // representable scalar default fills in the default instead of `None`, while a required field
-    // (default rustdoc-only) still comes from the payload.
+    // Prove schema defaults are never applied: an absent optional field with a `default` decodes
+    // as `None` and is not serialized, while a required field still comes from the payload.
     std::fs::create_dir_all(out.join("tests")).unwrap();
     std::fs::write(
         out.join("tests/defaults.rs"),
         r##"
 #[test]
-fn absent_optional_fields_use_schema_defaults() {
+fn absent_optional_fields_stay_absent_despite_schema_defaults() {
     let settings: basic_client::types::Settings =
         serde_json::from_str(r#"{"retries": 7}"#).unwrap();
-    assert_eq!(settings.color.as_deref(), Some("red"));
-    assert_eq!(settings.enabled, Some(true));
-    assert_eq!(settings.ratio, Some(1.5));
+    assert_eq!(settings.color, None);
+    assert_eq!(settings.enabled, None);
+    assert_eq!(settings.ratio, None);
+    assert_eq!(settings.wide, None);
+    assert_eq!(settings.mode, None);
     assert_eq!(settings.retries, 7);
-    assert_eq!(settings.mode, Some(basic_client::types::Mode::Auto));
+    assert_eq!(
+        serde_json::to_value(&settings).unwrap(),
+        serde_json::json!({"retries": 7})
+    );
 }
 
 #[test]
@@ -829,19 +911,20 @@ fn pattern_properties_capture_into_typed_overflow_map() {
 
 #[test]
 fn null_mixed_enum_field_is_option_of_enum() {
-    // The null-mixed `Priority` enum lowered to a real Rust enum used behind `Option`: an absent
-    // field and an explicit `null` both deserialize to `None`; a string value to the variant.
+    // The null-mixed `Priority` enum lowered to a real Rust enum used behind `Option`. The member
+    // is optional too, so absence and an explicit `null` stay apart: `None` is absent,
+    // `Some(None)` is `null`, and a string value is the variant.
     let absent: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n"}"#).unwrap();
     assert_eq!(absent.priority, None);
 
     let explicit_null: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n", "priority": null}"#).unwrap();
-    assert_eq!(explicit_null.priority, None);
+    assert_eq!(explicit_null.priority, Some(None));
 
     let set: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n", "priority": "high"}"#).unwrap();
-    assert_eq!(set.priority, Some(basic_client::types::Priority::High));
+    assert_eq!(set.priority, Some(Some(basic_client::types::Priority::High)));
 }
 
 #[test]
@@ -902,6 +985,53 @@ fn overlapping_unions_enforce_one_of_and_canonicalize_any_of() {
     ));
     assert!(serde_json::to_value(ambiguous).is_err());
     assert!(serde_json::from_str::<basic_client::types::OneOverlap>(r#""other""#).is_ok());
+}
+
+#[test]
+fn constant_keyed_variants_win_over_an_open_fallback() {
+    use basic_client::types::Contact;
+    let decode = |json: serde_json::Value| serde_json::from_value::<Contact>(json).unwrap();
+
+    let sms = decode(serde_json::json!({"platform": "sms", "handle": "+1"}));
+    assert!(matches!(sms, Contact::SmsContact(_)));
+    // A member the closed variant does not declare is ignored, and the variant is kept.
+    let sms = decode(serde_json::json!({"platform": "sms", "handle": "+1", "addedLater": 1}));
+    assert!(matches!(sms, Contact::SmsContact(_)));
+    assert_eq!(
+        serde_json::to_value(&sms).unwrap(),
+        serde_json::json!({"platform": "sms", "handle": "+1"})
+    );
+    // The open variant keeps it.
+    let email = decode(serde_json::json!({"platform": "email", "address": "a@b", "addedLater": 1}));
+    assert!(matches!(email, Contact::EmailContact(_)));
+    assert_eq!(serde_json::to_value(&email).unwrap()["addedLater"], 1);
+
+    // An unknown constant, or a known one whose variant cannot read the value, is the fallback.
+    let unknown = decode(serde_json::json!({"platform": "fax", "handle": "+1"}));
+    assert!(matches!(unknown, Contact::UnknownContact(_)));
+    let unreadable = decode(serde_json::json!({"platform": "sms"}));
+    assert!(matches!(unreadable, Contact::UnknownContact(_)));
+
+    // A variant that is a union keys on the constants all of its variants share.
+    use basic_client::types::{Post, SmsPost};
+    let post: Post =
+        serde_json::from_value(serde_json::json!({"platform": "sms", "state": "sent", "addedLater": 1}))
+            .unwrap();
+    assert!(matches!(&post, Post::SmsPost(inner) if matches!(**inner, SmsPost::SmsSent(_))));
+    let post: Post =
+        serde_json::from_value(serde_json::json!({"platform": "fax", "state": "sent"})).unwrap();
+    assert!(matches!(post, Post::UnknownPost(_)));
+}
+
+#[test]
+fn a_type_array_of_scalars_and_null_is_a_nullable_union() {
+    use basic_client::types::MixedCode;
+    for json in [serde_json::json!(7), serde_json::json!("seven"), serde_json::Value::Null] {
+        let code: Option<MixedCode> = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(code.is_none(), json.is_null());
+        assert_eq!(serde_json::to_value(&code).unwrap(), json);
+    }
+    assert!(serde_json::from_value::<Option<MixedCode>>(serde_json::json!(true)).is_err());
 }
 
 #[test]
@@ -991,7 +1121,8 @@ fn nullable_variant_union_resolves_null_at_option() {
     // bare value.
     let null: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n", "notes": null}"#).unwrap();
-    assert!(null.notes.is_none());
+    // `notes` is optional as well, so `null` is present-and-null, apart from absent.
+    assert!(matches!(null.notes, Some(None)));
 
     let text: basic_client::types::User =
         serde_json::from_str(r#"{"id": "u", "name": "n", "notes": "hi"}"#).unwrap();
@@ -1073,6 +1204,7 @@ fn multipart_body_struct_has_typed_form_part_fields() {
         caption: "a caption".to_owned(),
         count: Some(3),
         tags: Some(vec!["x".to_owned(), "y".to_owned()]),
+        additional: Default::default(),
     };
     assert_eq!(&body.file[..], b"hello");
     assert_eq!(body.caption, "a caption");
@@ -1480,15 +1612,18 @@ fn oas32_constructs_reach_the_wire() {
     // makes an out-of-enum region unconstructible.
     assert_eq!(oas32_client::servers::default_url(), "https://us.example.com/v1");
     assert_eq!(
-        oas32_client::servers::Server0::new()
-            .region(oas32_client::servers::Server0Region::Eu)
+        oas32_client::servers::Server::new()
+            .region(oas32_client::servers::ServerRegion::Eu)
             .version("v2")
             .url(),
         "https://eu.example.com/v2"
     );
 
     let params = oas32_client::ListRecordsParams::default()
-        .filter(oas32_client::types::Query { term: Some("a b".to_owned()) })
+        .filter(oas32_client::types::Query {
+            term: Some("a b".to_owned()),
+            additional: Default::default(),
+        })
         .session("a/b".to_owned());
     let client = oas32_client::BlockingClient::new(&format!("http://{addr}")).unwrap();
     let response = client.list_records(Some(params)).unwrap();
@@ -1616,8 +1751,14 @@ fn pet_strategy() -> impl Strategy<Value = types::Pet> {
         "[a-zA-Z0-9 ]{0,16}".prop_map(|name| types::Pet::Cat(Box::new(types::Cat {
             pet_type: "cat".to_owned(),
             name,
+            additional: Default::default(),
         }))),
-        any::<bool>().prop_map(|bark| types::Pet::Dog(Box::new(types::Dog { bark }))),
+        any::<bool>().prop_map(|bark| {
+            types::Pet::Dog(Box::new(types::Dog {
+                bark,
+                additional: Default::default(),
+            }))
+        }),
     ]
 }
 
@@ -1662,7 +1803,12 @@ fn account_strategy() -> impl Strategy<Value = types::Account> {
         "[a-zA-Z0-9]{0,12}",
         proptest::option::of("[a-zA-Z0-9]{0,12}"),
     )
-        .prop_map(|(id, label, owner)| types::Account { id, label, owner })
+        .prop_map(|(id, label, owner)| types::Account {
+            id,
+            label,
+            owner,
+            additional: Default::default(),
+        })
 }
 
 proptest! {
@@ -2432,6 +2578,63 @@ components:
       anyOf:
         - $ref: "#/components/schemas/BroadOwner"
         - $ref: "#/components/schemas/DetailedOwner"
+    # Variants keyed by a constant beside an open fallback: a known platform with a member added
+    # later must stay its own variant, not fall to the fallback that reads it exactly.
+    SmsContact:
+      type: object
+      additionalProperties: false
+      required: [platform, handle]
+      properties:
+        platform: { type: string, const: sms }
+        handle: { type: string }
+    EmailContact:
+      type: object
+      required: [platform, address]
+      properties:
+        platform: { type: string, const: email }
+        address: { type: string }
+    UnknownContact:
+      type: object
+      required: [platform]
+      properties:
+        platform: { type: string }
+    Contact:
+      anyOf:
+        - $ref: "#/components/schemas/SmsContact"
+        - $ref: "#/components/schemas/EmailContact"
+        - $ref: "#/components/schemas/UnknownContact"
+    # The same one level down: a known platform's variant is itself a union of closed objects.
+    SmsDraft:
+      type: object
+      additionalProperties: false
+      required: [platform, state]
+      properties:
+        platform: { type: string, const: sms }
+        state: { type: string, const: draft }
+    SmsSent:
+      type: object
+      additionalProperties: false
+      required: [platform, state]
+      properties:
+        platform: { type: string, const: sms }
+        state: { type: string, const: sent }
+    SmsPost:
+      oneOf:
+        - $ref: "#/components/schemas/SmsDraft"
+        - $ref: "#/components/schemas/SmsSent"
+    UnknownPost:
+      type: object
+      required: [platform, state]
+      properties:
+        platform: { type: string }
+        state: { type: string }
+    Post:
+      anyOf:
+        - $ref: "#/components/schemas/SmsPost"
+        - $ref: "#/components/schemas/UnknownPost"
+    # A type array of several scalars and null: a nullable union of the scalars.
+    MixedCode:
+      type: [integer, string, "null"]
     ContentFile:
       type: object
       required: [type, content]
@@ -2461,6 +2664,15 @@ components:
       properties:
         id:
           type: string
+        # An inline property's description moves onto its field. Prose ending in a block quote must
+        # not swallow the default note that follows it (`clippy::doc_lazy_continuation`).
+        nickname:
+          type: string
+          default: ""
+          description: |-
+            What friends call the user.
+
+            > Shown instead of the name when present.
         external_id:
           type: string
           format: uuid
@@ -2499,6 +2711,12 @@ components:
           $ref: "#/components/schemas/OneOverlap"
         any_owner:
           $ref: "#/components/schemas/AnyOwner"
+        contact:
+          $ref: "#/components/schemas/Contact"
+        post:
+          $ref: "#/components/schemas/Post"
+        mixed_code:
+          $ref: "#/components/schemas/MixedCode"
         mixed_content:
           $ref: "#/components/schemas/MixedContent"
     # Discriminated union: `petType` selects the object variant. Cat DECLARES `petType` as a required
@@ -2608,8 +2826,8 @@ components:
       type: string
       enum: [auto, manual]
       default: auto
-    # Exercises schema `default`: representable scalar defaults on optional fields are wired via
-    # generated serde providers; a required field's default is rustdoc-only.
+    # Exercises schema `default`: every default is documented in rustdoc and never applied, so an
+    # absent optional field decodes as `None`.
     Settings:
       type: object
       required: [retries]
@@ -2626,8 +2844,7 @@ components:
         retries:
           type: integer
           default: 3
-        # Out-of-range for i32: must NOT be serde-wired (rustdoc-only, W005). If a regression wired
-        # `Some(5000000000)` into `Option<i32>`, the generated crate's `cargo check` would fail.
+        # Out-of-range for i32: documented as written and reported (W005).
         wide:
           type: integer
           format: int32
@@ -2991,7 +3208,7 @@ bytes = "1.12.1"
 reqwest = { version = "0.12.28", default-features = false }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 
 [workspace]
 "#,
@@ -3148,19 +3365,23 @@ fn date_and_date_time_reach_the_wire_as_rfc3339() {
     let generated = std::fs::read_to_string(out.join("src/lib.rs")).unwrap();
     // The model resolves to the embedded newtypes, not to `time`'s own types — naming those in a
     // model is exactly the defect, since they carry the non-RFC-3339 serde implementation. (The
-    // newtype *definitions* name them, which is why this checks the aliases rather than the file.)
+    // newtype *definitions* name them, which is why this checks the fields rather than the file.)
+    // Inline scalar properties get no alias: the field spells out the newtype directly.
     assert!(
-        generated.contains("pub type Eventat = DateTime;"),
+        generated.contains("pub at: DateTime,"),
         "a date-time property must resolve to the RFC 3339 newtype: {generated}"
     );
     assert!(
-        generated.contains("pub type Eventday = Date;"),
+        generated.contains("pub day: Date,"),
         "a date property must resolve to the RFC 3339 newtype: {generated}"
     );
     assert!(
-        !generated.contains("pub type Eventat = time::")
-            && !generated.contains("pub type Eventday = time::"),
-        "no model alias may name time's own serde types"
+        !generated.contains("pub at: time::") && !generated.contains("pub day: time::"),
+        "no model field may name time's own serde types"
+    );
+    assert!(
+        !generated.contains("pub type Eventat") && !generated.contains("pub type Eventday"),
+        "inline scalar properties must not get positional aliases"
     );
     assert!(
         generated.contains("pub struct DateTime(pub time::OffsetDateTime)"),
@@ -3269,7 +3490,11 @@ fn dates_are_rfc3339_on_the_wire_in_both_directions() {
     let day = dates_client::Date(
         time::Date::from_calendar_date(2023, time::Month::November, 14).unwrap(),
     );
-    let event = dates_client::types::Event { at, day };
+    let event = dates_client::types::Event {
+        at,
+        day,
+        additional: Default::default(),
+    };
 
     let params = dates_client::CreateEventParams::default()
         .since(at)
@@ -3497,6 +3722,7 @@ fn rfc6570_multipart_parts_are_not_percent_encoded() {
         tags: vec!["blue".into(), "black".into()],
         paths: vec!["a/b".into(), "c".into()],
         names: vec!["ada".into(), "grace".into()],
+        additional: Default::default(),
     };
     client.upload(&body).expect("upload round-trips");
 

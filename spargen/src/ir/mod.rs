@@ -27,7 +27,7 @@ pub use operation::{
     PathTemplate,
 };
 pub use types::{
-    AdditionalProps, DefaultValue, DisjointFeature, Field, FieldDefault, JsonCategory, Prim,
+    AdditionalProps, Constraints, DisjointFeature, Field, FieldDefault, JsonCategory, Prim,
     PropertyName, ScalarEnum, ScalarRepr, ScalarValue, Struct, Ty, TypeDef, TypeGraph, TypeId,
     TypeKind, Union, UnionMode, UnionStrategy, UnionVariant, XmlField,
 };

@@ -867,7 +867,13 @@ fn lower_frontend(
         return Err(());
     }
 
-    let names = name::allocate(&api, diags);
+    let names = name::allocate(
+        &api,
+        &name::NameOptions {
+            strict: spec.strict_names,
+        },
+        diags,
+    );
     if diags.has_errors() {
         return Err(());
     }

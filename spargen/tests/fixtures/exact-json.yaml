@@ -1,0 +1,154 @@
+openapi: 3.1.0
+info: { title: Exact JSON, version: 1.0.0 }
+paths:
+  /items:
+    post:
+      operationId: createItem
+      parameters:
+        - { name: label, in: query, schema: { type: string, pattern: '^\S+$' } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10 } }
+        - { name: order, in: query, schema: { $ref: '#/components/schemas/Order' } }
+        - { name: tier, in: query, schema: { $ref: '#/components/schemas/Tier' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Item' }
+      responses:
+        '200':
+          description: The item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Item' }
+  /items/{id}:
+    get:
+      operationId: getSummary
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: A summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Summary' }
+  /items/{id}/grade:
+    get:
+      operationId: getGrade
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: A graded item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Graded' }
+  /items/feed:
+    get:
+      operationId: itemFeed
+      responses:
+        '200':
+          description: Items as they change
+          content:
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/Item' }
+components:
+  schemas:
+    Item:
+      type: object
+      required: [name, count, at]
+      properties:
+        name: { type: string, minLength: 2, maxLength: 3, pattern: '^\S+$' }
+        count: { type: integer, minimum: 0, exclusiveMaximum: 100, multipleOf: 2 }
+        status: { type: integer, enum: [200, 404] }
+        at: { type: string, format: date-time }
+        stamp:
+          type: string
+          format: date-time
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{3})?)?Z$'
+        tags: { type: array, items: { type: string }, minItems: 1, uniqueItems: true }
+        scores: { type: array, items: { type: number }, uniqueItems: true }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+          propertyNames: { pattern: '^[a-z]+$' }
+          maxProperties: 2
+        prefix: { type: array, prefixItems: [{ type: string, const: '*' }] }
+        gone: { not: {} }
+        nickname: { type: [string, 'null'] }
+        pick: { $ref: '#/components/schemas/Pick' }
+        closed: { $ref: '#/components/schemas/Apple' }
+        limits:
+          type: object
+          properties:
+            cap: { type: integer }
+          additionalProperties: { type: integer, maximum: 10 }
+        address: { $ref: '#/components/schemas/Mailbox' }
+        code:
+          anyOf:
+            - { type: integer, minimum: 0 }
+            - { type: integer, maximum: -10 }
+            - { type: 'null' }
+    Summary:
+      type: object
+      required: [id, flag]
+      properties:
+        id: { type: string }
+        note: { type: string }
+        flag: { type: [string, 'null'] }
+        count: { type: integer }
+        state: { $ref: '#/components/schemas/State' }
+    Pick:
+      oneOf:
+        - { $ref: '#/components/schemas/Apple' }
+        - { $ref: '#/components/schemas/Berry' }
+    Apple:
+      type: object
+      additionalProperties: false
+      properties:
+        a: { type: string }
+    Berry:
+      type: object
+      additionalProperties: false
+      properties:
+        b: { type: string }
+    State:
+      type: string
+      enum: [open, closed, unknown]
+    Order:
+      type: string
+      enum: [asc, desc]
+    Graded:
+      allOf:
+        - { $ref: '#/components/schemas/Grade' }
+        - { $ref: '#/components/schemas/TierConstraint' }
+    Grade:
+      anyOf:
+        - { $ref: '#/components/schemas/Kiwi' }
+        - { $ref: '#/components/schemas/Plum' }
+    Kiwi:
+      type: object
+      required: [k]
+      properties:
+        k: { type: string }
+        tier: { type: string }
+    Plum:
+      type: object
+      required: [p]
+      properties:
+        p: { type: string }
+        tier: { type: string }
+    TierConstraint:
+      type: object
+      properties:
+        tier: { $ref: '#/components/schemas/Tier' }
+    Tier:
+      type: string
+      enum: [gold, silver]
+    Mailbox:
+      description: A mailbox address.
+      type: string
+      minLength: 1
+      pattern: '^[^\s@]+@[^\s@]+$'
+      oneOf:
+        - { type: string }
+        - { type: string, pattern: '\s' }

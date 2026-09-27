@@ -14,6 +14,11 @@ pub struct TypeId(pub u32);
 #[derive(Debug, Clone, Default)]
 pub struct TypeGraph {
     defs: IndexMap<TypeId, TypeDef>,
+    /// Types that carry a document-given name: `components/schemas` roots, vendored remote roots,
+    /// and `components/headers` schemas. Every other structural type (a scalar, array, tuple, …) is
+    /// an inline position and is spelled out at its use sites instead of receiving a positional
+    /// alias name.
+    named: std::collections::HashSet<TypeId>,
 }
 
 impl TypeGraph {
@@ -38,6 +43,8 @@ impl TypeGraph {
             kind: TypeKind::Any,
             docs: Docs::default(),
             provenance: Provenance::new(JsonPointer::root(), None),
+            positional: None,
+            constraints: Vec::new(),
         })
     }
 
@@ -52,7 +59,9 @@ impl TypeGraph {
     /// root — always the last def inserted while lowering its body — into its reserved id, which
     /// keeps ids dense (the freed id is immediately reused by the next insert).
     pub fn pop_last(&mut self) -> Option<(TypeId, TypeDef)> {
-        self.defs.pop()
+        let popped = self.defs.pop()?;
+        self.named.remove(&popped.0);
+        Some(popped)
     }
 
     /// The definition for `id`, if present.
@@ -64,6 +73,30 @@ impl TypeGraph {
     /// not change ids or insertion order (e.g. suppressing an XML field rename on a shared type).
     pub fn get_mut(&mut self, id: TypeId) -> Option<&mut TypeDef> {
         self.defs.get_mut(&id)
+    }
+
+    /// The number of definitions, including reserved placeholders.
+    pub fn len(&self) -> usize {
+        self.defs.len()
+    }
+
+    /// Record that `id` is named by the document (a component, remote root, or header component).
+    pub fn mark_named(&mut self, id: TypeId) {
+        self.named.insert(id);
+    }
+
+    /// Whether `id` is named by the document rather than derived from an inline position.
+    pub fn is_named(&self, id: TypeId) -> bool {
+        self.named.contains(&id)
+    }
+
+    /// Record why `id`'s name is positional (see [`TypeDef::positional`]).
+    pub fn mark_positional(&mut self, id: TypeId, reason: String) {
+        if let Some(def) = self.defs.get_mut(&id) {
+            if def.positional.is_none() {
+                def.positional = Some(reason);
+            }
+        }
     }
 
     /// Iterate `(id, def)` pairs in insertion order.
@@ -83,6 +116,53 @@ pub struct TypeDef {
     pub docs: Docs,
     /// Where the type came from.
     pub provenance: Provenance,
+    /// Why the type's name hint is positional rather than document-given (an inline union member
+    /// named `Variant<n>`, a tuple item named `Item<n>`, a union with two members referencing the
+    /// same component), or `None`. Under `strict_names` a live, named, positional type is `E026`.
+    pub positional: Option<String>,
+    /// Validation keywords a value of this type must also satisfy, beyond what its Rust type
+    /// guarantees. Every set applies (an intersection concatenates them). The client does not
+    /// enforce them; a `date-time` whose `pattern` requires milliseconds is written with them.
+    pub constraints: Vec<Constraints>,
+}
+
+/// The JSON Schema validation keywords of one schema that the Rust type cannot express, recorded
+/// for documentation and output formatting. Each applies only to values of its own JSON type.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Constraints {
+    /// `pattern`: an ECMA-262 regular expression the string must contain a match of.
+    pub pattern: Option<String>,
+    /// `minLength`, in Unicode code points.
+    pub min_length: Option<u64>,
+    /// `maxLength`, in Unicode code points.
+    pub max_length: Option<u64>,
+    /// `minimum`.
+    pub minimum: Option<f64>,
+    /// `maximum`.
+    pub maximum: Option<f64>,
+    /// `exclusiveMinimum`.
+    pub exclusive_minimum: Option<f64>,
+    /// `exclusiveMaximum`.
+    pub exclusive_maximum: Option<f64>,
+    /// `multipleOf`.
+    pub multiple_of: Option<f64>,
+    /// `minItems`.
+    pub min_items: Option<u64>,
+    /// `maxItems`.
+    pub max_items: Option<u64>,
+    /// `uniqueItems: true`.
+    pub unique_items: bool,
+    /// `minProperties`.
+    pub min_properties: Option<u64>,
+    /// `maxProperties`.
+    pub max_properties: Option<u64>,
+}
+
+impl Constraints {
+    /// Whether no keyword is set.
+    pub fn is_empty(&self) -> bool {
+        *self == Constraints::default()
+    }
 }
 
 /// A reference to a type, plus the two shape modifiers that ride on a use site rather than the
@@ -139,6 +219,10 @@ pub struct Union {
     pub variants: Vec<UnionVariant>,
     /// How the union is (de)serialized.
     pub strategy: UnionStrategy,
+    /// Named component types every value must also satisfy (from `allOf [<union>, <constraint>…]`).
+    /// Each is checked against the JSON value on deserialize and serialize, so the accepted and
+    /// produced values are exactly the intersection while the variants keep their own types.
+    pub constraints: Vec<Ty>,
 }
 
 /// One variant of a [`Union`]: a name hint (allocated to a Rust variant identifier by `name`) and
@@ -266,6 +350,10 @@ pub struct Field {
     pub ty: Ty,
     /// Whether the property is `required`.
     pub required: bool,
+    /// The property schema's own documentation, when the property position has any (for example
+    /// a description beside a `$ref` or on a nullable wrapper). Rendered on the field when the
+    /// field's type does not already carry it.
+    pub docs: super::Docs,
     /// `deprecated` → `#[deprecated]`.
     pub deprecated: bool,
     /// `readOnly` annotation (W-class, surfaced in rustdoc).
@@ -316,39 +404,15 @@ impl XmlField {
     }
 }
 
-/// A field's JSON Schema `default` disposition. Every `default` is given exactly one of three
-/// dispositions — never silently dropped:
-///
-/// * a representable scalar wired through serde (`applied` is `Some`), which also documents the
-///   value in rustdoc;
-/// * a representable scalar on a required (or nullable) field, documented in rustdoc only
-///   (`applied` is `None`); or
-/// * a non-representable default (object/array/null/heterogeneous or scalar-type mismatch),
-///   documented in rustdoc and reported once as `W005` during lowering (`applied` is `None`).
-#[derive(Debug, Clone)]
+/// A field's JSON Schema `default`, documented in rustdoc and never applied. The client leaves an
+/// absent optional field `None` (and does not serialize it), so the service applies its own
+/// default; filling it in would send or report a value the peer never did. A default that is not a
+/// scalar matching the field's type (object/array/null/heterogeneous or scalar-type mismatch) is
+/// also reported once as `W005` during lowering.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FieldDefault {
     /// The rustdoc note line describing the default (e.g. ``Default: `active`.``).
     pub doc_note: String,
-    /// The scalar to wire through a generated serde default provider, when the default is
-    /// representable *and* the field is a plain optional (non-required, non-nullable) scalar.
-    pub applied: Option<DefaultValue>,
-}
-
-/// A representable scalar `default`, carried so codegen can render it as a correct Rust literal for
-/// the field's Rust type.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DefaultValue {
-    /// A boolean literal.
-    Bool(bool),
-    /// An integer literal (rendered unsuffixed so it infers to the field's `i32`/`i64`).
-    Int(i64),
-    /// A floating-point literal (rendered with a decimal point).
-    Float(f64),
-    /// A string literal.
-    Str(String),
-    /// A string-repr [`ScalarEnum`] variant, identified by its wire value; codegen renders it as
-    /// the generated enum variant rather than a raw string.
-    EnumVariant(String),
 }
 
 /// The `additionalProperties` policy of a [`Struct`] (matrix: Schema shape).

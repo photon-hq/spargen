@@ -7,6 +7,7 @@
 
 mod emit;
 mod format;
+mod normalize;
 
 use crate::diag::Diagnostics;
 use crate::ir::Api;

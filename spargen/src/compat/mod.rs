@@ -556,7 +556,14 @@ pub(crate) const MAX_CARVE_ROUNDS: usize = 64;
 pub(crate) fn carve_rules(diagnostics: &[Diagnostic]) -> Vec<OmitRule> {
     let mut rules: Vec<OmitRule> = Vec::new();
     for diagnostic in diagnostics {
-        if diagnostic.severity != Severity::Error {
+        // A strict-naming collision is a naming policy, not an unsupported construct: omitting API
+        // surface to dodge it would be exactly the silent loss carving must never cause.
+        if diagnostic.severity != Severity::Error
+            || matches!(
+                diagnostic.code,
+                Code::GeneratedNameCollision | Code::GeneratedPositionalName
+            )
+        {
             continue;
         }
         if let Some(rule) = omittable_enclosing(&diagnostic.pointer) {

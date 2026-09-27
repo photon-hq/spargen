@@ -10,6 +10,8 @@ pub enum IdentRole {
     Field,
     /// An enum variant (`PascalCase`).
     Variant,
+    /// A union variant named after the component it holds: spelled like that component's type.
+    NamedVariant,
     /// A method name (`snake_case`).
     Method,
     /// A module name (`snake_case`).
@@ -22,27 +24,37 @@ pub enum IdentRole {
 /// otherwise, and leading digits / invalid starts repaired.
 pub fn escape(raw: &str, role: IdentRole) -> Ident {
     let mut ident = match role {
-        IdentRole::Type | IdentRole::Variant => to_pascal_case(raw),
+        // A name the document already spells as a Rust type name (`OAuthClient`) is kept exactly;
+        // only names that are not identifiers are re-cased.
+        IdentRole::Type | IdentRole::NamedVariant if is_type_name(raw) => raw.to_owned(),
+        IdentRole::Type | IdentRole::Variant | IdentRole::NamedVariant => to_pascal_case(raw),
         IdentRole::Field | IdentRole::Method | IdentRole::Param => to_snake_case(raw),
     };
 
     ident.retain(|ch| ch == '_' || ch.is_ascii_alphanumeric());
     if ident.is_empty() {
         ident = match role {
-            IdentRole::Type | IdentRole::Variant => "Generated".to_owned(),
+            IdentRole::Type | IdentRole::Variant | IdentRole::NamedVariant => {
+                "Generated".to_owned()
+            }
             _ => "generated".to_owned(),
         };
     }
 
     if ident.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
         ident = match role {
-            IdentRole::Type | IdentRole::Variant => format!("N{ident}"),
+            IdentRole::Type | IdentRole::Variant | IdentRole::NamedVariant => format!("N{ident}"),
             _ => format!("n_{ident}"),
         };
     }
 
     if is_keyword(&ident) {
-        if can_raw_escape(&ident) && !matches!(role, IdentRole::Type | IdentRole::Variant) {
+        if can_raw_escape(&ident)
+            && !matches!(
+                role,
+                IdentRole::Type | IdentRole::Variant | IdentRole::NamedVariant
+            )
+        {
             ident = format!("r#{ident}");
         } else {
             ident.push('_');
@@ -50,6 +62,13 @@ pub fn escape(raw: &str, role: IdentRole) -> Ident {
     }
 
     Ident::new(ident)
+}
+
+/// Whether `raw` is already a Rust type name: an ASCII letter-and-digit identifier that starts with
+/// an upper-case letter.
+fn is_type_name(raw: &str) -> bool {
+    raw.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
+        && raw.chars().all(|ch| ch.is_ascii_alphanumeric())
 }
 
 fn is_keyword(ident: &str) -> bool {

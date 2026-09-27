@@ -335,7 +335,9 @@ components:
     assert!(code.contains("pub struct Alias"), "{code}");
     assert!(code.contains("pub struct Node"), "{code}");
     assert!(code.contains("Option<Box<Alias>>"), "{code}");
-    assert!(code.contains("pub value: Nodevalue"), "{code}");
+    // An inline scalar property is spelled out, not aliased under a positional name.
+    assert!(code.contains("pub value: String"), "{code}");
+    assert!(!code.contains("Nodevalue"), "{code}");
 }
 
 #[test]
@@ -2957,7 +2959,7 @@ paths:
         !has_code(&report, Code::DeclarationHasNoEffect),
         "the dynamic Content-Type boundary must not be discarded: {report:#?}"
     );
-    assert!(code.contains("content_type: types::ContentType"), "{code}");
+    assert!(code.contains("content_type: String"), "{code}");
     assert!(
         code.contains(".header(\n                \"content-type\""),
         "{code}"
@@ -3690,10 +3692,10 @@ fn w005_check_generate_parity() {
     assert!(has_code(&report, Code::SchemaDefaultNotApplied));
 }
 
-/// A representable scalar default on an optional field is applied via serde and must not raise
-/// W005 (or any error): generation succeeds and the field is documented with its default.
+/// A representable scalar default on an optional field is documented (never applied) and must not
+/// raise W005 (or any error).
 #[test]
-fn representable_scalar_default_applies_without_w005() {
+fn representable_scalar_default_documented_without_w005() {
     let report = generate(
         r##"
 openapi: 3.1.0
@@ -3818,9 +3820,9 @@ components:
 }
 
 /// An out-of-range integer default for the field's width (`int32` here) is NOT representable: it
-/// must fire W005 and stay rustdoc-only, never rendered into a literal that fails to compile.
+/// must fire W005 and is documented as written.
 #[test]
-fn out_of_range_int_default_fires_w005_and_is_not_wired() {
+fn out_of_range_int_default_fires_w005() {
     let report = generate(
         r##"
 openapi: 3.1.0
@@ -4573,13 +4575,13 @@ components:
     );
     assert_ne!(report.outcome, Outcome::Rejected, "{report:#?}");
     assert!(code.contains("ListPetsStatus200Headers"), "{code}");
-    // A required header is a plain field; an optional one is an Option. Inline header schemas get
-    // a synthesized named type, exactly as inline schemas elsewhere do.
-    assert!(
-        code.contains("pub x_rate_limit_remaining: types::HeaderXRateLimitRemaining"),
-        "{code}"
-    );
-    assert!(code.contains("pub x_next: Option<"), "{code}");
+    // A required header is a plain field; an optional one is an Option. An inline scalar header
+    // schema is spelled out; a header component is named after the component.
+    assert!(code.contains("pub x_rate_limit_remaining: i64"), "{code}");
+    // A scalar header component needs no type of its own either.
+    assert!(code.contains("pub x_next: Option<String>"), "{code}");
+    assert!(!code.contains("pub type Next"), "{code}");
+    assert!(!code.contains("HeaderX"), "{code}");
     assert!(code.contains("from_response"), "{code}");
     // A documented `Content-Type` is ignored per the specification, and said so.
     assert!(
@@ -5119,4 +5121,406 @@ paths:
     );
     // The operation's own documentation is not displaced by it.
     assert!(code.contains("List them."), "{code}");
+}
+
+/// As [`check`] and [`generate_with_code`], with `strict_names` on.
+fn strict_reports(spec: &str) -> (Report, Report, String) {
+    let temp = tempfile::tempdir().unwrap();
+    let spec_path = Utf8PathBuf::from_path_buf(temp.path().join("openapi.yaml")).unwrap();
+    std::fs::write(&spec_path, spec).unwrap();
+    let out = Utf8PathBuf::from_path_buf(temp.path().join("client.rs")).unwrap();
+    let strict = Spec::new(spec_path).strict_names(true);
+    let checked = spargen::check(&strict);
+    let generated = spargen::generate(&strict.build(out.clone()).cargo(CargoIntegration::Off));
+    let code = std::fs::read_to_string(out).unwrap_or_default();
+    (checked, generated, code)
+}
+
+const COLLIDING_NAMES_SPEC: &str = r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /a:
+    get:
+      operationId: getA
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [on, off] }
+  /b:
+    get:
+      operationId: getB
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [up, down] }
+"##;
+
+#[test]
+fn e025_strict_names_reject_hash_suffixed_public_names() {
+    // Without the knob, the second inline body and its enum get stable hash suffixes.
+    let (report, code) = generate_with_code(COLLIDING_NAMES_SPEC);
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(
+        !has_code(&report, Code::GeneratedNameCollision),
+        "{report:#?}"
+    );
+    assert!(code.contains("pub enum ResponseBodystatus {"), "{code}");
+    assert_eq!(
+        code.matches("pub enum ResponseBodystatus").count(),
+        2,
+        "{code}"
+    );
+
+    // With it, `check` and `generate` both refuse, one E025 per contested name, listing every
+    // position that claims it.
+    let (checked, generated, code) = strict_reports(COLLIDING_NAMES_SPEC);
+    for report in [&checked, &generated] {
+        assert_eq!(report.outcome, Outcome::Rejected, "{report:#?}");
+        let collisions: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == Code::GeneratedNameCollision)
+            .collect();
+        assert_eq!(collisions.len(), 2, "{report:#?}");
+        let body = collisions
+            .iter()
+            .find(|d| d.message.contains("`ResponseBody`"))
+            .expect("the body collision is reported");
+        assert!(
+            body.message
+                .contains("`#/paths/~1a/get/responses/200/content/application~1json/schema`")
+                && body
+                    .message
+                    .contains("`#/paths/~1b/get/responses/200/content/application~1json/schema`"),
+            "{body:#?}"
+        );
+        assert!(collisions
+            .iter()
+            .any(|d| d.message.contains("`ResponseBodystatus`")));
+    }
+    assert!(code.is_empty(), "a rejected strict build writes nothing");
+}
+
+#[test]
+fn strict_names_accept_distinct_document_names() {
+    let (checked, generated, code) = strict_reports(
+        r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+servers:
+  - url: https://api.example.com
+paths:
+  /a/{id}:
+    get:
+      operationId: getA
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          headers:
+            RateLimit: { $ref: "#/components/headers/RateLimit" }
+            X-Request-Id: { $ref: "#/components/headers/RequestIdHeader" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/A" }
+  /b/{id}:
+    get:
+      operationId: getB
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          headers:
+            RateLimit: { $ref: "#/components/headers/RateLimit" }
+            X-Request-Id: { $ref: "#/components/headers/RequestIdHeader" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/B" }
+components:
+  headers:
+    RateLimit:
+      description: Remaining quota.
+      schema: { type: string }
+    RequestIdHeader:
+      schema: { $ref: "#/components/schemas/RequestId" }
+  schemas:
+    RequestId: { type: string, description: A request identifier. }
+    A:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, description: The display name. }
+        tags: { type: array, items: { type: string } }
+    B:
+      type: object
+      properties:
+        name: { type: string }
+"##,
+    );
+    assert_eq!(checked.outcome, Outcome::Clean, "{checked:#?}");
+    assert_eq!(generated.outcome, Outcome::Generated, "{generated:#?}");
+    // A scalar header component is spelled out; a header whose schema is a `$ref` keeps that
+    // schema's name.
+    assert!(code.contains("pub rate_limit: Option<String>"), "{code}");
+    assert!(!code.contains("pub type RateLimit"), "{code}");
+    assert!(
+        code.contains("pub x_request_id: Option<types::RequestId>"),
+        "{code}"
+    );
+    assert!(!code.contains("pub type RequestIdHeader"), "{code}");
+    assert!(!code.contains("HeaderRateLimit"), "{code}");
+    // Inline scalar properties, arrays and parameters are spelled out, with the property's docs
+    // moved onto the field.
+    assert!(code.contains("pub name: String,"), "{code}");
+    assert!(code.contains("pub tags: Option<Vec<String>>,"), "{code}");
+    assert!(code.contains("The display name."), "{code}");
+    assert!(!code.contains("pub type Aname"), "{code}");
+    assert!(!code.contains("pub type Atags"), "{code}");
+    assert!(!code.contains("pub type Id"), "{code}");
+    // A lone fixed server needs no builder type.
+    assert!(!code.contains("Server0"), "{code}");
+    assert!(!code.contains("pub struct Server"), "{code}");
+    assert!(
+        code.contains("\"https://api.example.com\".to_owned()"),
+        "{code}"
+    );
+}
+
+#[test]
+fn enum_header_components_are_named_after_the_component() {
+    let (report, code) = generate_with_code(
+        r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /a:
+    get:
+      operationId: getA
+      responses:
+        "200":
+          description: OK
+          headers:
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+  /b:
+    get:
+      operationId: getB
+      responses:
+        "200":
+          description: OK
+          headers:
+            Cache-Control: { $ref: "#/components/headers/CacheControl" }
+components:
+  headers:
+    CacheControl:
+      schema: { type: string, enum: [no-store, no-cache] }
+"##,
+    );
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert_eq!(code.matches("pub enum CacheControl {").count(), 1, "{code}");
+    assert!(
+        code.contains("pub cache_control: Option<types::CacheControl>"),
+        "{code}"
+    );
+}
+
+#[test]
+fn nullable_references_reuse_the_referenced_type() {
+    let (report, code) = generate_with_code(
+        r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /a:
+    get:
+      operationId: getA
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+components:
+  schemas:
+    Account:
+      type: object
+      required: [plan, owner]
+      properties:
+        plan:
+          description: The current plan, or null.
+          anyOf: [{ $ref: "#/components/schemas/Plan" }, { type: "null" }]
+        owner:
+          oneOf: [{ $ref: "#/components/schemas/Owner" }, { type: "null" }]
+    Plan:
+      type: object
+      properties: { id: { type: string } }
+    MaybePlan:
+      anyOf: [{ $ref: "#/components/schemas/Plan" }, { type: "null" }]
+    Owner:
+      type: object
+      properties: { name: { type: string } }
+"##,
+    );
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(code.contains("pub plan: Option<Plan>,"), "{code}");
+    assert!(code.contains("pub owner: Option<Owner>,"), "{code}");
+    assert!(code.contains("The current plan, or null."), "{code}");
+    assert!(!code.contains("Accountplan"), "{code}");
+    assert!(!code.contains("Accountowner"), "{code}");
+    // A component that is itself `X | null` keeps its own name.
+    assert!(code.contains("pub struct MaybePlan"), "{code}");
+}
+
+#[test]
+fn constant_query_parameters_are_checked_strings() {
+    let (report, code) = generate_with_code(
+        r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /counts:
+    get:
+      operationId: countThings
+      parameters:
+        - { name: groupBy, in: query, required: true, schema: { type: string, const: day } }
+        - { name: interval, in: query, schema: { type: string, enum: [hour] } }
+      responses:
+        "204": { description: No Content }
+"##,
+    );
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(code.contains("group_by: String"), "{code}");
+    assert!(code.contains("pub interval: Option<String>"), "{code}");
+    assert!(code.contains("must be the constant"), "{code}");
+    assert!(!code.contains("pub enum GroupBy"), "{code}");
+    assert!(!code.contains("pub enum Interval"), "{code}");
+}
+
+const POSITIONAL_SPEC: &str = r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /a:
+    get:
+      operationId: getA
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Shape" }
+components:
+  schemas:
+    Circle:
+      type: object
+      required: [radius]
+      properties: { radius: { type: number } }
+    Shape:
+      oneOf:
+        - { $ref: "#/components/schemas/Circle" }
+        - type: object
+          required: [side]
+          properties: { side: { type: number } }
+"##;
+
+#[test]
+fn e026_strict_names_reject_positional_union_members() {
+    let (report, code) = generate_with_code(POSITIONAL_SPEC);
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    assert!(code.contains("Circle(Box<Circle>)"), "{code}");
+    assert!(code.contains("pub struct ShapeVariant1"), "{code}");
+
+    let (checked, generated, _) = strict_reports(POSITIONAL_SPEC);
+    for report in [&checked, &generated] {
+        assert_eq!(report.outcome, Outcome::Rejected, "{report:#?}");
+        let positional: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == Code::GeneratedPositionalName)
+            .collect();
+        assert_eq!(positional.len(), 1, "{report:#?}");
+        assert_eq!(
+            positional[0].pointer.as_str(),
+            "/components/schemas/Shape/oneOf/1"
+        );
+    }
+}
+
+#[test]
+fn all_of_over_a_union_keeps_member_types_and_checks_constraints() {
+    let (report, code) = generate_with_code(
+        r##"
+openapi: 3.1.0
+info: { title: T, version: 1.0.0 }
+paths:
+  /a:
+    get:
+      operationId: getA
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActivePet" }
+components:
+  schemas:
+    Cat:
+      type: object
+      additionalProperties: false
+      required: [kind, status]
+      properties:
+        kind: { type: string, const: cat }
+        status: { type: string, enum: [active, retired] }
+    Dog:
+      type: object
+      additionalProperties: false
+      required: [kind, status]
+      properties:
+        kind: { type: string, const: dog }
+        status: { type: string, enum: [active, retired] }
+    Fish:
+      type: object
+      additionalProperties: false
+      required: [kind, status]
+      properties:
+        kind: { type: string, const: fish }
+        status: { type: string, const: retired }
+    Pet:
+      anyOf:
+        - { $ref: "#/components/schemas/Cat" }
+        - { $ref: "#/components/schemas/Dog" }
+        - { $ref: "#/components/schemas/Fish" }
+    ActiveConstraint:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, const: active }
+    ActivePet:
+      allOf:
+        - { $ref: "#/components/schemas/Pet" }
+        - { $ref: "#/components/schemas/ActiveConstraint" }
+"##,
+    );
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+    // The variants are the members' own types; the member no value can satisfy is dropped.
+    assert!(code.contains("ActivePet::Cat(inner)"), "{code}");
+    assert!(code.contains("ActivePet::Dog(inner)"), "{code}");
+    assert!(!code.contains("ActivePet::Fish"), "{code}");
+    assert!(!code.contains("ActivePetCat"), "{code}");
+    assert!(
+        code.contains("<ActiveConstraint as serde::Deserialize>::deserialize(&value)"),
+        "{code}"
+    );
 }

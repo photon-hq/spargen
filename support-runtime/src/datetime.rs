@@ -104,15 +104,170 @@ impl fmt::Display for DateTime {
     }
 }
 
+impl DateTime {
+    /// Parse an RFC 3339 `date-time` exactly: `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`, with an
+    /// upper-case `T` and `Z`, a year from 0001, a real calendar day and no leap second.
+    pub fn parse_strict(text: &str) -> Result<Self, ParseError> {
+        parse_date_time(text, true)
+    }
+
+    /// As [`parse_strict`](Self::parse_strict), but seconds may be omitted (`HH:MM`), `T` and `Z`
+    /// may be lower case (RFC 3339 §5.6) and the year may be 0000: every value a contract with a
+    /// `date-time` format or its own `pattern` may carry.
+    pub fn parse_lenient(text: &str) -> Result<Self, ParseError> {
+        parse_date_time(text, false)
+    }
+}
+
+impl DateTime {
+    /// RFC 3339 with exactly three fractional digits (`2024-01-01T00:00:00.000Z`): the form a
+    /// `date-time` takes where the contract's `pattern` requires milliseconds.
+    pub fn to_millis_string(&self) -> String {
+        let value = self.0;
+        let offset = value.offset();
+        let zone = if offset.is_utc() {
+            "Z".to_owned()
+        } else {
+            let (hours, minutes, _) = offset.as_hms();
+            let sign = if hours < 0 || minutes < 0 { '-' } else { '+' };
+            format!(
+                "{sign}{:02}:{:02}",
+                hours.unsigned_abs(),
+                minutes.unsigned_abs()
+            )
+        };
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}{zone}",
+            value.year(),
+            u8::from(value.month()),
+            value.day(),
+            value.hour(),
+            value.minute(),
+            value.second(),
+            value.millisecond(),
+        )
+    }
+}
+
+/// Serialize a value whose JSON strings are all `date-time`s with three fractional digits (see
+/// [`DateTime::to_millis_string`]).
+pub fn serialize_millis<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize + ?Sized,
+{
+    fn rewrite(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => {
+                if let Ok(parsed) = DateTime::parse_lenient(text) {
+                    *text = parsed.to_millis_string();
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(rewrite),
+            _ => {}
+        }
+    }
+    let mut json = serde_json::to_value(value).map_err(serde::ser::Error::custom)?;
+    rewrite(&mut json);
+    json.serialize(serializer)
+}
+
+fn parse_date_time(text: &str, strict: bool) -> Result<DateTime, ParseError> {
+    let invalid = || ParseError {
+        expected: "date-time",
+    };
+    let bytes = text.as_bytes();
+    let digits = |range: std::ops::Range<usize>| -> Result<u32, ParseError> {
+        let part = bytes.get(range).ok_or_else(invalid)?;
+        if part.is_empty() || !part.iter().all(u8::is_ascii_digit) {
+            return Err(invalid());
+        }
+        std::str::from_utf8(part)
+            .ok()
+            .and_then(|part| part.parse().ok())
+            .ok_or_else(invalid)
+    };
+    if bytes.len() < 17
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !(bytes[10] == b'T' || (!strict && bytes[10] == b't'))
+        || bytes[13] != b':'
+    {
+        return Err(invalid());
+    }
+    let year = digits(0..4)?;
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    let hour = digits(11..13)?;
+    let minute = digits(14..16)?;
+    let mut index = 16;
+    let mut second = 0;
+    let mut nanosecond = 0u32;
+    if bytes.get(index) == Some(&b':') {
+        second = digits(index + 1..index + 3)?;
+        index += 3;
+        if bytes.get(index) == Some(&b'.') {
+            let start = index + 1;
+            let mut end = start;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            if end == start {
+                return Err(invalid());
+            }
+            // Nanosecond precision; further digits are below what `time` can represent.
+            let mut scaled = 0u32;
+            for position in 0..9 {
+                let digit = bytes
+                    .get(start + position)
+                    .filter(|_| start + position < end);
+                scaled = scaled * 10 + digit.map_or(0, |digit| u32::from(digit - b'0'));
+            }
+            nanosecond = scaled;
+            index = end;
+        }
+    } else if strict {
+        return Err(invalid());
+    }
+    let offset = match bytes.get(index) {
+        Some(b'Z') if index + 1 == bytes.len() => 0i32,
+        Some(b'z') if !strict && index + 1 == bytes.len() => 0i32,
+        Some(sign @ (b'+' | b'-')) if index + 6 == bytes.len() && bytes[index + 3] == b':' => {
+            let hours = digits(index + 1..index + 3)?;
+            let minutes = digits(index + 4..index + 6)?;
+            if hours > 23 || minutes > 59 {
+                return Err(invalid());
+            }
+            let total = (hours * 3600 + minutes * 60) as i32;
+            if *sign == b'-' {
+                -total
+            } else {
+                total
+            }
+        }
+        _ => return Err(invalid()),
+    };
+    if (strict && year == 0) || hour > 23 || minute > 59 || second > 59 {
+        return Err(invalid());
+    }
+    let month = u8::try_from(month)
+        .ok()
+        .and_then(|month| time::Month::try_from(month).ok())
+        .ok_or_else(invalid)?;
+    let date =
+        time::Date::from_calendar_date(year as i32, month, day as u8).map_err(|_| invalid())?;
+    let clock = time::Time::from_hms_nano(hour as u8, minute as u8, second as u8, nanosecond)
+        .map_err(|_| invalid())?;
+    let offset = time::UtcOffset::from_whole_seconds(offset).map_err(|_| invalid())?;
+    Ok(DateTime(date.with_time(clock).assume_offset(offset)))
+}
+
 impl FromStr for DateTime {
     type Err = ParseError;
 
+    /// Strict RFC 3339 (see [`DateTime::parse_strict`]).
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        time::OffsetDateTime::parse(text, &Rfc3339)
-            .map(Self)
-            .map_err(|_| ParseError {
-                expected: "date-time",
-            })
+        Self::parse_strict(text)
     }
 }
 
@@ -126,9 +281,10 @@ impl Serialize for DateTime {
 }
 
 impl<'de> Deserialize<'de> for DateTime {
+    /// Lenient (see [`DateTime::parse_lenient`]), so no value the contract allows is refused.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        text.parse().map_err(D::Error::custom)
+        Self::parse_lenient(&text).map_err(D::Error::custom)
     }
 }
 

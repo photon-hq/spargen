@@ -304,7 +304,9 @@ fn requirement_table(requirements: &RuntimeRequirements) -> Vec<Requirement> {
     }
     push(SECRECY, NONE, false);
     push(SERDE, &["derive"], false);
-    push(SERDE_JSON, NONE, false);
+    // Exact number parsing: without it serde_json may read a float one unit in the last place
+    // off, so a value would not round-trip unchanged.
+    push(SERDE_JSON, &["float_roundtrip"], false);
     if requirements.xml {
         push(QUICK_XML, &["serialize"], false);
     }
@@ -758,7 +760,7 @@ bytes = "1.12.1"
 reqwest = { version = "0.12.28", default-features = false }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 "#;
 
     fn audit_manifest(contents: &str, requirements: RuntimeRequirements) -> Vec<Diagnostic> {

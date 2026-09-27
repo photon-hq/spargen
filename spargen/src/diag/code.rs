@@ -97,6 +97,12 @@ pub enum Code {
     CargoIntegrationDegraded,
     /// Cargo integration was required by the caller but is not available in this process.
     CargoIntegrationRequired,
+    /// Under `strict_names`, two or more positions would generate the same public identifier, so
+    /// all but one would need a hash-suffixed name.
+    GeneratedNameCollision,
+    /// Under `strict_names`, a generated type could only be named by its position (an inline
+    /// union member or tuple item, or a union with two members referencing the same component).
+    GeneratedPositionalName,
 }
 
 impl Code {
@@ -135,6 +141,8 @@ impl Code {
             Code::RuntimeAuditSkipped => "W012",
             Code::CargoIntegrationDegraded => "W013",
             Code::CargoIntegrationRequired => "E024",
+            Code::GeneratedNameCollision => "E025",
+            Code::GeneratedPositionalName => "E026",
         }
     }
 
@@ -182,6 +190,8 @@ impl Code {
             Code::RuntimeAuditSkipped => "runtime-dependency audit skipped",
             Code::CargoIntegrationDegraded => "cargo integration degraded",
             Code::CargoIntegrationRequired => "cargo integration required but unavailable",
+            Code::GeneratedNameCollision => "generated name collision",
+            Code::GeneratedPositionalName => "positional generated name",
         }
     }
 
@@ -252,7 +262,7 @@ impl Code {
                 "After applying omit rules, the remaining document is structurally invalid. Omit dependent consumers too, or fix the source schema."
             }
             Code::SchemaDefaultNotApplied => {
-                "A `default` is applied as a serde deserialization default only when it is a single scalar (bool/integer/number/string) that matches the field's own scalar type or one of its enum variants. Object, array, null, heterogeneous, or type-mismatched defaults cannot be lowered to a Rust literal, so the value is recorded in the field's rustdoc but not wired — deserialization of an absent field yields `None` rather than the default."
+                "A `default` is documented in rustdoc and never applied: an absent optional field deserializes as `None` and is not serialized, so the service applies its own default. This warning marks a `default` that is not a single scalar (bool/integer/number/string) matching the field's own scalar type or one of its enum variants (an object, array, null, heterogeneous, or type-mismatched value), recorded in the field's rustdoc as written, or a `default` in a position with no field, parameter, or type to document it on."
             }
             Code::Oas32ConstructIgnored => {
                 "OpenAPI 3.2 `itemSchema` describes one item of sequential media. On a non-sequential media type it does not define any wire behavior, so spargen acknowledges and ignores it while continuing to use the complete-body `schema`. Move the item schema to sequential media such as `application/x-ndjson`, `application/json-seq`, or `text/event-stream`, or use only `schema` for ordinary media."
@@ -283,6 +293,12 @@ impl Code {
             }
             Code::CargoIntegrationRequired => {
                 "The caller set `CargoIntegration::Required`, declaring that this generation must be wired into Cargo — rebuild triggers emitted, consumer manifest audited — and it is not: either the process is not a build script, or no consumer manifest could be found. This is an error rather than a warning purely because the caller asked for it: `Required` exists for builds where a missed rebuild trigger would ship a client generated from a stale spec. Move the call into a `build.rs`, or relax to `CargoIntegration::Auto` (degrade with `W013`/`W012`) or `CargoIntegration::Off` (degrade silently)."
+            }
+            Code::GeneratedNameCollision => {
+                "Generated names come from the document: component names, property and parameter names, enum values, operation IDs, and — for an inline schema with no name of its own — its position (`<Parent><property>`, `Variant<n>`, `Item`). When two positions produce the same Rust identifier in one scope, spargen normally keeps the first spelling and gives the others a stable suffix hashed from their JSON Pointer (`RequestId1a2b3c4d`). That suffix is deterministic but meaningless, and which position keeps the plain name depends on document order, so it is a poor public name. With `strict_names` on (`Spec::strict_names(true)` or `strict_names = true` in `spargen.toml`), every such collision in a public name — a model, field, enum or union variant, client method, parameters struct, response-header struct or field, or server builder — is this error instead, listing each position that claims the name. Fix it in the document: give each colliding schema its own `components/schemas` entry (or reuse one shared component), and put a reused response header in `components/headers`. Generator-owned local bindings inside method bodies are not public and never trigger it."
+            }
+            Code::GeneratedPositionalName => {
+                "A type the document gives no name is named after its position: `<Parent>Variant<n>` for an inline `oneOf`/`anyOf` member (or a narrowed one), `<Parent>Item<n>` for a `prefixItems` tuple item, and a numbered variant when two union members reference the same component. Such a name says nothing about the type and changes when members are reordered. With `strict_names` on, every such type that the generated API uses is this error. Give the member its own `components/schemas` entry and reference it. Scalars, arrays and other inline types that are spelled out directly never need a name and never trigger it."
             }
             Code::XmlHintIgnored => {
                 "XML request/response bodies honor the `xml.name` (element/attribute rename) and `xml.attribute` (serialize as an XML attribute via quick-xml's `@name` convention) hints on a field, but only for a schema used *exclusively* as an XML body. A serde `rename` is format-agnostic — it would also rewrite the JSON wire names — so `xml.name`/`xml.attribute` are NOT applied to a schema that is also reachable from a JSON/form/multipart/text body, a response, or a parameter (or that is not used as an XML body at all); the field keeps its normal wire name and this warning fires, so JSON is never corrupted. The `xml.namespace`, `xml.prefix`, and `xml.wrapped` (wrapped arrays) hints are never represented — quick-xml serde has no faithful mapping for them — so they are always ignored with this warning rather than silently honored or rejected."
@@ -335,6 +351,8 @@ impl Code {
             Code::RuntimeAuditSkipped,
             Code::CargoIntegrationDegraded,
             Code::CargoIntegrationRequired,
+            Code::GeneratedNameCollision,
+            Code::GeneratedPositionalName,
         ];
         ALL
     }

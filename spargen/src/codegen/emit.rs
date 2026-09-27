@@ -3,12 +3,12 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
-    AdditionalProps, Api, ApiKeyLoc, DisjointFeature, ErrorShape, Field, HttpScheme, JsonCategory,
-    MediaType, Operation, ParamLoc, Prim, ScalarRepr, ScalarValue, SecurityScheme, SuccessShape,
-    Ty, TypeDef, TypeId, TypeKind, UnionMode, UnionStrategy,
+    AdditionalProps, Api, ApiKeyLoc, DisjointFeature, Docs, ErrorShape, Field, HttpScheme,
+    JsonCategory, MediaType, Operation, ParamLoc, Prim, ScalarRepr, ScalarValue, SecurityScheme,
+    SuccessShape, Ty, TypeDef, TypeId, TypeKind, UnionMode, UnionStrategy,
 };
 use crate::name::{Names, OperationBindings};
 
@@ -17,11 +17,25 @@ use super::CodegenOptions;
 /// Emit the `types` (models) module for every type in the graph, in deterministic order.
 pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) -> TokenStream {
     let requests = request_model_types(api);
+    let closed_enums = request_only_types(api);
+    // Only named types get an item. Inline types are spelled out where they are used, and a type
+    // with no name at all is a lowering by-product nothing in the API reaches.
     let items = api
         .types
         .iter()
-        .map(|(id, def)| emit_type_def(id, def, api, names, options, requests.contains(&id)));
-    let presence_helper = (!requests.is_empty()).then(|| {
+        .filter(|(id, _)| names.types.contains_key(id))
+        .map(|(id, def)| {
+            emit_type_def(
+                id,
+                def,
+                api,
+                names,
+                options,
+                requests.contains(&id),
+                !closed_enums.contains(&id),
+            )
+        });
+    let presence_helper = api.types.iter().any(|(_, def)| matches!(def.kind, TypeKind::Struct(_))).then(|| {
         quote! {
             // Serde's field default handles absence. For a present field, deserialize its actual
             // schema type first, preserving null only when that type permits it.
@@ -39,14 +53,38 @@ pub(crate) fn emit_models(api: &Api, names: &Names, options: &CodegenOptions) ->
     let datetime_import = (options.feature_time && api.uses_time()).then(|| {
         quote! { use super::{Date, DateTime}; }
     });
+    let const_helpers = emit_const_helpers(api, names, &requests);
+    let mut field_helpers = BTreeMap::new();
+    for (id, def) in api.types.iter() {
+        if !names.types.contains_key(&id) {
+            continue;
+        }
+        if let TypeKind::Struct(object) = &def.kind {
+            if let AdditionalProps::Typed(item) = &object.additional {
+                if let Some((helper, tokens)) = emit_overflow_helper(**item, api, names, options) {
+                    field_helpers.entry(helper.to_string()).or_insert(tokens);
+                }
+            }
+            for field in &object.fields {
+                if let Some((helper, tokens)) =
+                    emit_field_helper(field, api, names, options, requests.contains(&id))
+                {
+                    field_helpers.entry(helper.to_string()).or_insert(tokens);
+                }
+            }
+        }
+    }
+    let field_helpers = field_helpers.into_values();
     quote! {
         #[forbid(unsafe_code)]
-        #[allow(dead_code, unused_imports)]
+        #[allow(dead_code, unused_imports, clippy::deref_addrof, clippy::needless_borrow, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_call, clippy::get_first, clippy::explicit_auto_deref)]
         pub mod types {
             use serde::{Deserialize, Serialize};
             use std::collections::BTreeMap;
             #datetime_import
             #presence_helper
+            #const_helpers
+            #(#field_helpers)*
 
             #(#items)*
         }
@@ -82,6 +120,72 @@ fn request_model_types(api: &Api) -> BTreeSet<TypeId> {
         }
     }
     seen
+}
+
+/// The types reached from the given roots through fields, overflow maps, items, variants and
+/// union constraints.
+fn reachable_types(roots: impl IntoIterator<Item = TypeId>, api: &Api) -> BTreeSet<TypeId> {
+    let mut pending: Vec<TypeId> = roots.into_iter().collect();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match api.types.get(id).map(|def| &def.kind) {
+            Some(TypeKind::Struct(object)) => {
+                pending.extend(object.fields.iter().map(|field| field.ty.id));
+                if let AdditionalProps::Typed(ty) = &object.additional {
+                    pending.push(ty.id);
+                }
+            }
+            Some(TypeKind::Array(ty)) => pending.push(ty.id),
+            Some(TypeKind::Tuple(items)) => pending.extend(items.iter().map(|ty| ty.id)),
+            Some(TypeKind::Union(union)) => {
+                pending.extend(union.variants.iter().map(|variant| variant.ty.id));
+                // A value also passes through each constraint (`allOf [<union>, <constraint>]`).
+                pending.extend(union.constraints.iter().map(|ty| ty.id));
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// The types only requests use (bodies and parameters), never a response body or header. Their
+/// string enums stay closed: a client sends only the values the contract lists. Every other string
+/// enum of two or more values is open, so a value the server adds later still decodes.
+fn request_only_types(api: &Api) -> BTreeSet<TypeId> {
+    let requests = reachable_types(
+        api.operations.iter().flat_map(|operation| {
+            let body = operation
+                .request_body
+                .as_ref()
+                .and_then(|body| body.ty.map(|ty| ty.id));
+            body.into_iter()
+                .chain(operation.params.iter().map(|param| param.ty.id))
+        }),
+        api,
+    );
+    let responses = reachable_types(
+        api.operations.iter().flat_map(|operation| {
+            operation
+                .responses
+                .by_status
+                .iter()
+                .map(|(_, response)| response)
+                .chain(operation.responses.default.as_ref())
+                .flat_map(|response| {
+                    response
+                        .body
+                        .map(|ty| ty.id)
+                        .into_iter()
+                        .chain(response.headers.iter().map(|header| header.ty.id))
+                })
+                .collect::<Vec<_>>()
+        }),
+        api,
+    );
+    requests.difference(&responses).copied().collect()
 }
 
 /// The declared security schemes, rendered as rustdoc for `with_credential`.
@@ -160,7 +264,7 @@ pub(crate) fn emit_client(api: &Api, names: &Names, options: &CodegenOptions) ->
         }
 
         #[forbid(unsafe_code)]
-        #[allow(dead_code, unused_mut, unused_variables, clippy::result_large_err)]
+        #[allow(dead_code, unused_mut, unused_variables, clippy::result_large_err, clippy::deref_addrof, clippy::needless_borrow, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_call, clippy::get_first, clippy::explicit_auto_deref)]
         impl Client {
             pub fn new(base_url: &str) -> Result<Self, support::Error<std::convert::Infallible>> {
                 Self::with_client(reqwest::Client::new(), base_url)
@@ -246,6 +350,53 @@ pub(crate) fn emit_operation(
     // verbatim with the blocking shim so the two signatures can never drift.
     let (args, _arg_names) = operation_args(operation, names, options);
 
+    // A constant parameter is a plain `String`; anything but the constant is refused before a
+    // request is built, so only the value the one-variant enum could express is ever sent.
+    let const_checks: Vec<TokenStream> = operation
+        .params
+        .iter()
+        .filter_map(|param| {
+            let value = names.consts.get(&param.ty.id)?;
+            let message = format!("parameter `{}` must be the constant {value:?}", param.name);
+            let refuse_other = |binding: TokenStream| {
+                quote! {
+                    if #binding != #value {
+                        return Err(support::Error::request_message(#message));
+                    }
+                }
+            };
+            if param.required {
+                let ident = param_ident(param, crate::name::IdentRole::Param);
+                if param.ty.nullable {
+                    Some(quote! {
+                        if #ident.as_deref().is_some_and(|value| value != #value) {
+                            return Err(support::Error::request_message(#message));
+                        }
+                    })
+                } else {
+                    Some(refuse_other(quote! { #ident }))
+                }
+            } else {
+                let ident = param_ident(param, crate::name::IdentRole::Field);
+                let params_binding = bindings
+                    .params
+                    .as_ref()
+                    .expect("optional parameters argument allocated");
+                // An optional parameter's field is a single `Option<String>` whether or not it is
+                // nullable (absent and `null` both collapse to `None`), so the value bound below is
+                // already a plain `&String`.
+                let inner = refuse_other(quote! { value });
+                Some(quote! {
+                    if let Some(value) = #params_binding
+                        .as_ref()
+                        .and_then(|params| params.#ident.as_ref())
+                    {
+                        #inner
+                    }
+                })
+            }
+        })
+        .collect();
     let path_init = operation.path.raw.clone();
     let path_replacements = operation
         .params
@@ -866,6 +1017,7 @@ pub(crate) fn emit_operation(
             &self,
             #(#args),*
         ) -> Result<#return_ok_ty, support::Error<#error_ty>> {
+            #(#const_checks)*
             let mut #path_binding = #path_init.to_owned();
             #(#path_replacements)*
             let mut #query_binding: Vec<String> = Vec::new();
@@ -1028,7 +1180,7 @@ pub(crate) fn emit_blocking_client(
 
             #[cfg(all(feature = "blocking", not(target_arch = "wasm32")))]
             #[forbid(unsafe_code)]
-            #[allow(dead_code, unused_mut, unused_variables, clippy::result_large_err)]
+            #[allow(dead_code, unused_mut, unused_variables, clippy::result_large_err, clippy::deref_addrof, clippy::needless_borrow, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_call, clippy::get_first, clippy::explicit_auto_deref)]
             impl BlockingClient {
             /// Build a blocking client over a fresh default `reqwest::Client`.
             pub fn new(base_url: &str) -> Result<Self, support::Error<std::convert::Infallible>> {
@@ -1265,7 +1417,7 @@ fn emit_response_headers(
                 #(#fields),*
             }
 
-            #[allow(dead_code, deprecated)]
+            #[allow(dead_code, deprecated, clippy::deref_addrof, clippy::needless_borrow, clippy::needless_borrows_for_generic_args, clippy::redundant_closure_call, clippy::get_first, clippy::explicit_auto_deref)]
             impl #ident {
                 /// Read the documented headers out of a raw header map.
                 pub fn from_headers(
@@ -1294,6 +1446,29 @@ fn emit_response_headers(
 fn emit_servers(api: &Api, names: &Names) -> TokenStream {
     if api.servers.is_empty() {
         return quote! {};
+    }
+    // One fixed, unnamed server has nothing to configure, so a builder type would only add a
+    // positional name. `default_url` is the whole surface.
+    if let [server] = api.servers.as_slice() {
+        if server.name.is_none() && server.variables.is_empty() {
+            let url = &server.url;
+            let mut doc = format!("The declared server, `{url}`.");
+            if let Some(description) = &server.description {
+                doc.push_str("\n\n");
+                doc.push_str(description);
+            }
+            let doc = normalize_rustdoc(&doc);
+            return quote! {
+                /// Base URLs declared by the API description.
+                #[allow(dead_code)]
+                pub mod servers {
+                    #[doc = #doc]
+                    pub fn default_url() -> String {
+                        #url.to_owned()
+                    }
+                }
+            };
+        }
     }
     let builders = api.servers.iter().enumerate().map(|(index, server)| {
         let ident = names
@@ -2250,7 +2425,7 @@ pub(crate) fn emit_support(uses_xml: bool, uses_streams: bool, uses_time: bool) 
     // `time` mapping enabled; only then does the audit require `time` of the consumer.
     let datetime_module = uses_time.then(|| embed(&crate::support::datetime_runtime_file()));
     let datetime_reexport = uses_time.then(|| {
-        quote! { pub use datetime::{Date, DateTime}; }
+        quote! { pub use datetime::{serialize_millis, Date, DateTime}; }
     });
     // The blocking facade (`BlockingRuntime`) is embedded unconditionally but gated on the
     // `blocking` feature AND `not(target_arch = "wasm32")` at the module level: the tokio-dependent
@@ -2286,6 +2461,7 @@ pub(crate) fn emit_support(uses_xml: bool, uses_streams: bool, uses_time: bool) 
             pub use error::{Error, ProtocolError, RedirectError, RequestError, TimeoutKind, TransportError};
             pub use middleware::{Middleware, MiddlewareBackend, Next};
             pub use header::{parse_header, require_header, HeaderError, HeaderShape};
+            pub use json::{check_known_members, deserialize_normalized, integral, is_strict, retained_members, strictly};
             pub use parameter::{encode, serialize_deep_object, serialize_delimited, serialize_form, serialize_form_body, serialize_label, serialize_matrix, serialize_multipart_values, serialize_simple, Delimiter, FormMode, FormProperty, FormStyle, ParameterError, PercentEncoding};
             pub use paginate::{next_link, LinkPaginator};
             pub use response::ResponseValue;
@@ -2307,81 +2483,213 @@ fn emit_type_def(
     names: &Names,
     options: &CodegenOptions,
     request_model: bool,
+    open_enum: bool,
 ) -> TokenStream {
     let ident = names.types.get(&id).expect("type name allocated");
     let docs = doc_tokens(&def.docs);
     let deprecated = def.docs.deprecated.then(|| quote! { #[deprecated] });
     match &def.kind {
         TypeKind::Struct(object) => {
-            let deny_unknown = matches!(object.additional, AdditionalProps::Deny)
-                .then(|| quote! { #[serde(deny_unknown_fields)] });
+            // A closed object (`additionalProperties: false`) still ignores members it does not
+            // declare, so a response carrying a member added later decodes; only a trial union's
+            // exact pass (`support::strictly`) counts them against the object.
+            let closed = matches!(object.additional, AdditionalProps::Deny).then(|| {
+                let known = object.fields.iter().map(|field| field.name.wire.as_str());
+                quote! {
+                    impl<'de> serde::Deserialize<'de> for #ident {
+                        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                        where
+                            D: serde::Deserializer<'de>,
+                        {
+                            if super::support::is_strict() {
+                                let value = serde_json::Value::deserialize(deserializer)?;
+                                super::support::check_known_members::<D::Error>(
+                                    &value,
+                                    &[#(#known),*],
+                                )?;
+                                #ident::deserialize(value).map_err(serde::de::Error::custom)
+                            } else {
+                                #ident::deserialize(deserializer)
+                            }
+                        }
+                    }
+                    impl serde::Serialize for #ident {
+                        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                        where
+                            S: serde::Serializer,
+                        {
+                            #ident::serialize(self, serializer)
+                        }
+                    }
+                }
+            });
+            let remote = closed
+                .is_some()
+                .then(|| quote! { #[serde(remote = "Self")] });
             let fields = object
                 .fields
                 .iter()
-                .map(|field| emit_field(id, field, names, options, request_model));
-            let providers = object
-                .fields
-                .iter()
-                .filter_map(|field| emit_default_provider(id, field, names, options));
+                .map(|field| emit_field(id, field, api, names, options, request_model));
+
             let additional = match &object.additional {
-                AdditionalProps::Typed(ty) => {
-                    let ty = ty_tokens(**ty, names, options, false);
+                AdditionalProps::Typed(item) => {
+                    let ty = ty_tokens(**item, names, options, false);
                     let overflow = names
                         .struct_overflow
                         .get(&id)
                         .expect("overflow field name allocated");
-                    quote! { #[serde(flatten)] pub #overflow: BTreeMap<String, #ty>, }
+                    let normalized =
+                        emit_overflow_helper(**item, api, names, options).map(|(helper, _)| {
+                            let helper = helper.to_string();
+                            quote! { deserialize_with = #helper, }
+                        });
+                    quote! { #[serde(flatten, #normalized)] pub #overflow: BTreeMap<String, #ty>, }
                 }
-                AdditionalProps::Allow | AdditionalProps::Deny => quote! {},
+                // An open object keeps the members it does not declare, so they round-trip. The
+                // XML codec cannot write a flattened map, so an XML body keeps its declared shape.
+                AdditionalProps::Allow if xml_types(api).contains(&id) => quote! {},
+                AdditionalProps::Allow => {
+                    let overflow = names
+                        .struct_overflow
+                        .get(&id)
+                        .expect("overflow field name allocated");
+                    quote! {
+                        /// Members the schema does not declare, kept as received.
+                        #[serde(flatten)]
+                        pub #overflow: BTreeMap<String, serde_json::Value>,
+                    }
+                }
+                AdditionalProps::Deny => quote! {},
             };
             quote! {
                 #docs
                 #deprecated
                 #[derive(Debug, Clone, Serialize, Deserialize)]
-                #deny_unknown
+                #remote
                 pub struct #ident {
                     #(#fields)*
                     #additional
                 }
-                #(#providers)*
+                #closed
             }
         }
         TypeKind::Enum(enumeration) if enumeration.repr == ScalarRepr::String => {
-            let variants = enumeration.variants.iter().map(|variant| {
-                let value = match variant {
-                    ScalarValue::String(value) => value,
-                    _ => unreachable!("string repr has string variants"),
-                };
-                let ident = names
-                    .variants
-                    .get(&(id, value.clone()))
-                    .expect("variant name allocated");
-                quote! { #[serde(rename = #value)] #ident, }
-            });
-            let display_arms = enumeration.variants.iter().map(|variant| {
-                let value = match variant {
-                    ScalarValue::String(value) => value,
-                    _ => unreachable!("string repr has string variants"),
-                };
-                let variant_ident = names
-                    .variants
-                    .get(&(id, value.clone()))
-                    .expect("variant name allocated");
+            let values: Vec<(&String, &crate::name::Ident)> = enumeration
+                .variants
+                .iter()
+                .map(|variant| {
+                    let value = match variant {
+                        ScalarValue::String(value) => value,
+                        _ => unreachable!("string repr has string variants"),
+                    };
+                    let variant_ident = names
+                        .variants
+                        .get(&(id, value.clone()))
+                        .expect("variant name allocated");
+                    (value, variant_ident)
+                })
+                .collect();
+            let display_arms = values.iter().map(|(value, variant_ident)| {
                 quote! { #ident::#variant_ident => #value, }
             });
+            // A one-value enum is a constant: it stays exactly that value, as constant fields do.
+            if !open_enum || values.len() == 1 {
+                let variants = values.iter().map(|(value, variant_ident)| {
+                    quote! { #[serde(rename = #value)] #variant_ident, }
+                });
+                return quote! {
+                    #docs
+                    #deprecated
+                    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+                    #[non_exhaustive]
+                    pub enum #ident {
+                        #(#variants)*
+                    }
+
+                    impl std::fmt::Display for #ident {
+                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            f.write_str(match self {
+                                #(#display_arms)*
+                            })
+                        }
+                    }
+                };
+            }
+            // An open enum: the values the contract lists, plus one holding any other string, so a
+            // value the server adds later decodes and serializes back unchanged.
+            let unknown = unknown_variant_ident(values.iter().map(|(_, ident)| ident.as_str()));
+            let variants = values.iter().map(|(value, variant_ident)| {
+                let doc = format!("`{value}`");
+                quote! { #[doc = #doc] #variant_ident, }
+            });
+            // `Self`, not the type's name, so equal enums stay equal item for item.
+            let parse_arms = values.iter().map(|(value, variant_ident)| {
+                quote! { #value => Ok(Self::#variant_ident), }
+            });
+            let str_arms = values.iter().map(|(value, variant_ident)| {
+                quote! { Self::#variant_ident => #value, }
+            });
+            let known: Vec<&String> = values.iter().map(|(value, _)| *value).collect();
+            let expected = format!(
+                "one of {}",
+                known
+                    .iter()
+                    .map(|value| format!("`{value}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             quote! {
                 #docs
                 #deprecated
-                #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+                #[derive(Debug, Clone, PartialEq, Eq)]
+                #[non_exhaustive]
                 pub enum #ident {
                     #(#variants)*
+                    /// A value this version of the client does not know, kept as received.
+                    #unknown(String),
+                }
+
+                impl #ident {
+                    /// The value as it appears on the wire.
+                    pub fn as_str(&self) -> &str {
+                        match self {
+                            #(#str_arms)*
+                            Self::#unknown(value) => value,
+                        }
+                    }
                 }
 
                 impl std::fmt::Display for #ident {
                     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        f.write_str(match self {
-                            #(#display_arms)*
-                        })
+                        f.write_str(self.as_str())
+                    }
+                }
+
+                impl serde::Serialize for #ident {
+                    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                    where
+                        S: serde::Serializer,
+                    {
+                        serializer.serialize_str(self.as_str())
+                    }
+                }
+
+                impl<'de> serde::Deserialize<'de> for #ident {
+                    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                    where
+                        D: serde::Deserializer<'de>,
+                    {
+                        let value = String::deserialize(deserializer)?;
+                        match value.as_str() {
+                            #(#parse_arms)*
+                            // A trial union's exact pass counts an unlisted value against the
+                            // variant.
+                            _ if super::support::is_strict() => Err(serde::de::Error::invalid_value(
+                                serde::de::Unexpected::Str(&value),
+                                &#expected,
+                            )),
+                            _ => Ok(Self::#unknown(value)),
+                        }
                     }
                 }
             }
@@ -2422,6 +2730,28 @@ fn emit_type_def(
             }
         }
         TypeKind::Union(union) => {
+            // A union narrowed by `allOf` constraint components checks each constraint against the
+            // buffered JSON value, in both directions, instead of copying every member.
+            let constraint_checks: Vec<TokenStream> = union
+                .constraints
+                .iter()
+                .map(|constraint| {
+                    let ty = ty_tokens(
+                        crate::ir::Ty {
+                            boxed: false,
+                            nullable: false,
+                            ..*constraint
+                        },
+                        names,
+                        options,
+                        false,
+                    );
+                    quote! {
+                        <#ty as serde::Deserialize>::deserialize(&value)
+                            .map_err(serde::de::Error::custom)?;
+                    }
+                })
+                .collect();
             match &union.strategy {
                 // Strategy A: a discriminator → a custom `Deserialize`/`Serialize` over a buffered
                 // `serde_json::Value`. NOT serde `#[serde(tag = ...)]`: internal tagging consumes the tag
@@ -2462,8 +2792,10 @@ fn emit_type_def(
                                     JsonCategory::Array => quote! { value.is_array() },
                                     JsonCategory::Object => quote! { value.is_object() },
                                 };
+                                let normalize = variant_normalizer(api, names, variant.ty);
                                 Some(quote! {
                                     if #predicate {
+                                        #normalize
                                         return serde_json::from_value(value)
                                             .map(#ident::#variant_ident)
                                             .map_err(serde::de::Error::custom);
@@ -2480,10 +2812,14 @@ fn emit_type_def(
                                 .variants
                                 .get(&(id, variant.name_hint.clone()))
                                 .expect("union variant name allocated");
+                            let normalize = variant_normalizer(api, names, variant.ty);
                             Some(quote! {
-                                #tag => serde_json::from_value(value)
-                                    .map(#ident::#variant_ident)
-                                    .map_err(serde::de::Error::custom),
+                                #tag => {
+                                    #normalize
+                                    serde_json::from_value(value)
+                                        .map(#ident::#variant_ident)
+                                        .map_err(serde::de::Error::custom)
+                                }
                             })
                         });
                     let ser_arms = union.variants.iter().zip(tags).map(|(variant, tag)| {
@@ -2534,6 +2870,24 @@ fn emit_type_def(
                         Some(fallback) => fallback.clone(),
                         None => quote! { Err(serde::de::Error::custom(#unknown_tag)) },
                     };
+                    let serialize_impl = union_serialize_impl(
+                        ident,
+                        quote! {
+                                let (mut value, tag): (serde_json::Value, Option<&str>) = match self {
+                                    #(#ser_arms)*
+                                };
+                                if let Some(tag) = tag {
+                                    let serde_json::Value::Object(map) = &mut value else {
+                                        return Err(serde::ser::Error::custom(#non_object));
+                                    };
+                                    map.entry(#tag_field.to_owned()).or_insert_with(|| {
+                                        serde_json::Value::String(tag.to_owned())
+                                    });
+                                }
+                                value.serialize(serializer)
+                        },
+                        &constraint_checks,
+                    );
                     quote! {
                         #docs
                         #deprecated
@@ -2548,6 +2902,7 @@ fn emit_type_def(
                                 D: serde::Deserializer<'de>,
                             {
                                 let value = serde_json::Value::deserialize(deserializer)?;
+                                #(#constraint_checks)*
                                 #(#category_arms)*
                                 let tag = value
                                     .get(#tag_field)
@@ -2563,25 +2918,7 @@ fn emit_type_def(
                             }
                         }
 
-                        impl serde::Serialize for #ident {
-                            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                            where
-                                S: serde::Serializer,
-                            {
-                                let (mut value, tag): (serde_json::Value, Option<&str>) = match self {
-                                    #(#ser_arms)*
-                                };
-                                if let Some(tag) = tag {
-                                    let serde_json::Value::Object(map) = &mut value else {
-                                        return Err(serde::ser::Error::custom(#non_object));
-                                    };
-                                    map.entry(#tag_field.to_owned()).or_insert_with(|| {
-                                        serde_json::Value::String(tag.to_owned())
-                                    });
-                                }
-                                value.serialize(serializer)
-                            }
-                        }
+                        #serialize_impl
                     }
                 }
                 // Strategy B: no discriminator but statically-disjoint variants → an enum with a custom
@@ -2617,8 +2954,10 @@ fn emit_type_def(
                                     quote! { value.get(#key).is_some() }
                                 }
                             };
+                            let normalize = variant_normalizer(api, names, variant.ty);
                             quote! {
                                 if #predicate {
+                                    #normalize
                                     return serde_json::from_value(value)
                                         .map(#ident::#variant_ident)
                                         .map_err(serde::de::Error::custom);
@@ -2634,6 +2973,15 @@ fn emit_type_def(
                     });
                     let error_message =
                         format!("data did not match any variant of union {}", ident.as_str());
+                    let serialize_impl = union_serialize_impl(
+                        ident,
+                        quote! {
+                                match self {
+                                    #(#ser_arms)*
+                                }
+                        },
+                        &constraint_checks,
+                    );
                     quote! {
                         #docs
                         #deprecated
@@ -2648,24 +2996,23 @@ fn emit_type_def(
                                 D: serde::Deserializer<'de>,
                             {
                                 let value = serde_json::Value::deserialize(deserializer)?;
+                                #(#constraint_checks)*
                                 #(#de_arms)*
                                 Err(serde::de::Error::custom(#error_message))
                             }
                         }
 
-                        impl serde::Serialize for #ident {
-                            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                            where
-                                S: serde::Serializer,
-                            {
-                                match self {
-                                    #(#ser_arms)*
-                                }
-                            }
-                        }
+                        #serialize_impl
                     }
                 }
                 UnionStrategy::Trial { mode, priorities } => {
+                    // A variant pinning a property to one value (a `const` such as
+                    // `platform: "sms"`) is chosen by that value before any variant that would
+                    // only match through open or undeclared members.
+                    let keyed = union
+                        .variants
+                        .iter()
+                        .any(|variant| constants_carried(api, variant.ty).is_some());
                     let variant_defs = union.variants.iter().map(|variant| {
                         let variant_ident = names
                             .variants
@@ -2674,27 +3021,49 @@ fn emit_type_def(
                         let ty = union_variant_ty_tokens(variant.ty, names, options);
                         quote! { #variant_ident(#ty), }
                     });
-                    let attempts = union.variants.iter().zip(priorities).map(
-                    |(variant, priority)| {
-                        let variant_ident = names
+                    let attempts =
+                        union
                             .variants
-                            .get(&(id, variant.name_hint.clone()))
-                            .expect("union variant name allocated");
-                        let ty = union_variant_ty_tokens(variant.ty, names, options);
-                        quote! {
-                            if let Ok(inner) = serde_json::from_value::<#ty>(value.clone()) {
-                                match_count += 1;
-                                let replace = match &selected {
-                                    Some((selected_priority, _)) => #priority > *selected_priority,
-                                    None => true,
-                                };
-                                if replace {
-                                    selected = Some((#priority, #ident::#variant_ident(inner)));
+                            .iter()
+                            .zip(priorities)
+                            .map(|(variant, priority)| {
+                                let variant_ident = names
+                                    .variants
+                                    .get(&(id, variant.name_hint.clone()))
+                                    .expect("union variant name allocated");
+                                let ty = union_variant_ty_tokens(variant.ty, names, options);
+                                let mut attempt = variant_attempt(api, names, variant.ty, &ty);
+                                // In the keyed pass only the variants whose constants the value
+                                // carries are tried.
+                                if keyed {
+                                    attempt = match constants_carried(api, variant.ty) {
+                                        Some(carried) => quote! {
+                                            (!keyed || #carried).then(|| #attempt).flatten()
+                                        },
+                                        None => quote! { (!keyed).then(|| #attempt).flatten() },
+                                    };
                                 }
-                            }
-                        }
-                    },
-                );
+                                quote! {
+                                    if let Some(inner) = #attempt {
+                                        match_count += 1;
+                                        // Without an exact match, prefer the variant that keeps the most
+                                        // of the value's members.
+                                        let retained = if strict {
+                                            0
+                                        } else {
+                                            super::support::retained_members(&value, &inner)
+                                        };
+                                        let rank = (retained, #priority);
+                                        let replace = match &selected {
+                                            Some((selected_rank, _)) => rank > *selected_rank,
+                                            None => true,
+                                        };
+                                        if replace {
+                                            selected = Some((rank, #ident::#variant_ident(inner)));
+                                        }
+                                    }
+                                }
+                            });
                     let ser_arms = union.variants.iter().map(|variant| {
                         let variant_ident = names
                             .variants
@@ -2708,8 +3077,9 @@ fn emit_type_def(
                     });
                     let validations = union.variants.iter().map(|variant| {
                         let ty = union_variant_ty_tokens(variant.ty, names, options);
+                        let attempt = variant_attempt(api, names, variant.ty, &ty);
                         quote! {
-                            if serde_json::from_value::<#ty>(value.clone()).is_ok() {
+                            if #attempt.is_some() {
                                 match_count += 1;
                             }
                         }
@@ -2731,6 +3101,87 @@ fn emit_type_def(
                         "serialized value must match {expected} typed variant of union {}",
                         ident.as_str()
                     );
+                    let de_invalid = match mode {
+                        UnionMode::OneOf => quote! { match_count != 1 },
+                        UnionMode::AnyOf => quote! { match_count == 0 },
+                    };
+                    let pass_and_select = if keyed {
+                        let carried = union
+                            .variants
+                            .iter()
+                            .filter_map(|variant| constants_carried(api, variant.ty));
+                        quote! {
+                            let pass = |strict: bool, keyed: bool| -> (usize, Selected) {
+                                let mut match_count = 0_usize;
+                                let mut selected: Selected = None;
+                                #(#attempts)*
+                                (match_count, selected)
+                            };
+                            // Each pass is exact first, where members and enum values a variant
+                            // does not know count against it; if no variant matches exactly, the
+                            // best variant that reads the value, so a response carrying additions
+                            // still decodes. The keyed pass tries only the variants whose
+                            // constants the value carries; the others are the fallback.
+                            let select = |keyed: bool| -> (usize, Selected) {
+                                let (mut match_count, mut selected) = pass(true, keyed);
+                                if match_count == 0 && !super::support::is_strict() {
+                                    let (count, lenient) = pass(false, keyed);
+                                    match_count = count.min(1);
+                                    selected = lenient;
+                                }
+                                (match_count, selected)
+                            };
+                            let (mut match_count, mut selected) = (0_usize, None);
+                            if #(#carried)||* {
+                                (match_count, selected) = select(true);
+                            }
+                            if #de_invalid {
+                                (match_count, selected) = select(false);
+                            }
+                        }
+                    } else {
+                        quote! {
+                            let pass = |strict: bool| -> (usize, Selected) {
+                                let mut match_count = 0_usize;
+                                let mut selected: Selected = None;
+                                #(#attempts)*
+                                (match_count, selected)
+                            };
+                            // An exact pass first, where members and enum values a variant
+                            // does not know count against it; if no variant matches exactly,
+                            // the best variant that reads the value, so a response carrying
+                            // additions still decodes.
+                            let (mut match_count, mut selected) = pass(true);
+                            if match_count == 0 && !super::support::is_strict() {
+                                let (count, lenient) = pass(false);
+                                match_count = count.min(1);
+                                selected = lenient;
+                            }
+                        }
+                    };
+                    let serialize_impl = union_serialize_impl(
+                        ident,
+                        quote! {
+                                let value = match self {
+                                    #(#ser_arms),*
+                                };
+                                let count = |strict: bool| -> usize {
+                                    let mut match_count = 0_usize;
+                                    #(#validations)*
+                                    match_count
+                                };
+                                let mut match_count = count(true);
+                                if match_count == 0 && !super::support::is_strict() {
+                                    match_count = count(false).min(1);
+                                }
+                                if #ser_valid {
+                                    value.serialize(serializer)
+                                } else {
+                                    Err(serde::ser::Error::custom(#ser_error))
+                                }
+                        },
+                        &constraint_checks,
+                    );
                     quote! {
                         #docs
                         #deprecated
@@ -2745,9 +3196,10 @@ fn emit_type_def(
                                 D: serde::Deserializer<'de>,
                             {
                                 let value = serde_json::Value::deserialize(deserializer)?;
-                                let mut match_count = 0_usize;
-                                let mut selected: Option<(u32, Self)> = None;
-                                #(#attempts)*
+                                #(#constraint_checks)*
+                                // The chosen variant, ranked by (members kept, priority).
+                                type Selected = Option<((usize, u32), #ident)>;
+                                #pass_and_select
                                 if #de_valid {
                                     selected
                                         .map(|(_, value)| value)
@@ -2758,23 +3210,7 @@ fn emit_type_def(
                             }
                         }
 
-                        impl serde::Serialize for #ident {
-                            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                            where
-                                S: serde::Serializer,
-                            {
-                                let value = match self {
-                                    #(#ser_arms),*
-                                };
-                                let mut match_count = 0_usize;
-                                #(#validations)*
-                                if #ser_valid {
-                                    value.serialize(serializer)
-                                } else {
-                                    Err(serde::ser::Error::custom(#ser_error))
-                                }
-                            }
-                        }
+                        #serialize_impl
                     }
                 }
             }
@@ -2789,6 +3225,7 @@ fn emit_type_def(
 fn emit_field(
     id: crate::ir::TypeId,
     field: &Field,
+    api: &Api,
     names: &Names,
     options: &CodegenOptions,
     request_model: bool,
@@ -2805,16 +3242,46 @@ fn emit_field(
         .xml
         .wire_override(&field.name.wire)
         .unwrap_or_else(|| field.name.wire.clone());
-    // `ty_tokens` represents nullability. In request models an independent outer `Option`
-    // represents absence: None omits the key, Some(None) sends null, Some(Some(value)) sends value.
-    // Keep the existing shape of response-only models.
+    // `ty_tokens` represents nullability; an optional member gets an independent outer `Option` for
+    // absence. Where the member is nullable (or in a request model) the two stay apart: None omits
+    // the key, Some(None) is null, Some(Some(value)) is a value, so a decoded value serializes back
+    // unchanged. An optional non-nullable member of a response-only model reads `null` as absent.
     let mut ty = ty_tokens(field.ty, names, options, false);
-    if !field.required && (request_model || !field.ty.nullable) {
+    if !field.required {
         ty = quote! { Option<#ty> };
     }
-    let deserialize = if !request_model || (field.required && !field.ty.nullable) {
+    let presence = field_presence(field, request_model);
+    let validation = super::normalize::Normalization { api, names };
+    let normalized = !validation
+        .normalizer(
+            Ty {
+                nullable: false,
+                ..field.ty
+            },
+            quote! { value },
+            0,
+        )
+        .is_empty();
+    let deserialize = if let Some(value) = names.consts.get(&field.ty.id) {
+        // A string constant is a plain `String` whose value is checked in both directions, so it
+        // accepts and produces exactly what the one-variant enum it replaces did. The checked
+        // deserializers keep the presence rules below (a required field stays required; an
+        // optional request field keeps `deserialize_request_field`'s null handling).
+        let (de, ser) = const_helper_idents(names, value, presence);
+        let (de, ser) = (de.to_string(), ser.to_string());
+        quote! { deserialize_with = #de, serialize_with = #ser, }
+    } else if normalized {
+        let (helper, _) = emit_field_helper(field, api, names, options, request_model)
+            .expect("normalized field has a helper");
+        let helper = helper.to_string();
+        quote! { deserialize_with = #helper, }
+    } else if field.required && (!field.ty.nullable || !request_model) {
         // Ordinary required types already reject absence. Avoid generating redundant serde
-        // wrappers for those fields; only Option's special missing-field behavior needs overriding.
+        // wrappers for those fields; only Option's special missing-field behavior needs overriding
+        // (a response-only model keeps reading a missing nullable member as `None`).
+        quote! {}
+    } else if !field.required && !presence {
+        // An optional non-nullable member of a response-only model: `None` is absent or null.
         quote! {}
     } else if field.required {
         // An explicit deserializer makes serde reject a missing field even when its type is Option.
@@ -2822,18 +3289,35 @@ fn emit_field(
     } else {
         quote! { deserialize_with = "deserialize_request_field", }
     };
-    // An optional field always deserializes an absent value; when the spec gives a representable
-    // scalar default, point serde at a generated provider so the default fills in rather than
-    // `None`. Otherwise fall back to `Option::default()` (`None`).
+    // A `date-time` whose pattern demands milliseconds is written with exactly three fraction
+    // digits, alone or as the items of an array.
+    let millis = {
+        let direct = api.types.get(field.ty.id);
+        let item = match direct.map(|def| &def.kind) {
+            Some(TypeKind::Array(item)) if names.inline.contains_key(&field.ty.id) => {
+                api.types.get(item.id)
+            }
+            _ => None,
+        };
+        direct
+            .into_iter()
+            .chain(item)
+            .any(super::normalize::renders_millis)
+    };
+    let deserialize = if millis && options.feature_time {
+        quote! { #deserialize serialize_with = "super::support::serialize_millis", }
+    } else {
+        deserialize
+    };
+    // An absent optional field deserializes as `None` and `None` is not serialized, even when the
+    // spec declares a `default`: the default is documented, and the service applies it.
     let serde_default = if field.required {
-        quote! {}
-    } else if field
-        .default
-        .as_ref()
-        .is_some_and(|default| default.applied.is_some())
-    {
-        let provider = default_provider_ident(id, ident).to_string();
-        quote! { default = #provider, skip_serializing_if = "Option::is_none", }
+        // A response-only model reads a missing nullable member as `None`, also through a helper.
+        if normalized && field.ty.nullable && !request_model {
+            quote! { default, }
+        } else {
+            quote! {}
+        }
     } else {
         quote! { default, skip_serializing_if = "Option::is_none", }
     };
@@ -2850,78 +3334,436 @@ fn emit_field(
     if let Some(default) = &field.default {
         notes.push(default.doc_note.clone());
     }
-    let notes = notes
+    let notes: Vec<_> = notes
         .iter()
         .map(|note| normalize_rustdoc(note))
-        .map(|note| quote! { #[doc = #note] });
+        .map(|note| quote! { #[doc = #note] })
+        .collect();
+    // An inline type has no item to carry the property's documentation, so the field carries it.
+    // A blank line separates it from the notes, so prose ending in a list or block quote cannot
+    // swallow them as a lazy continuation.
+    // A named type carries its own docs; the field adds the property's own docs only when they
+    // differ (a description beside a `$ref`, or on a nullable reference).
+    let docs = match api.types.get(field.ty.id) {
+        Some(def) if names.inline.contains_key(&field.ty.id) => Some(doc_tokens(&def.docs)),
+        Some(def) if field.docs != Docs::default() && field.docs != def.docs => {
+            Some(doc_tokens(&field.docs))
+        }
+        _ => None,
+    }
+    .filter(|docs| !docs.is_empty());
+    let separator = (docs.is_some() && !notes.is_empty()).then(|| quote! { #[doc = ""] });
     quote! {
+        #docs
+        #separator
         #(#notes)*
         #[serde(rename = #wire, #serde_default #deserialize)]
         pub #ident: #ty,
     }
 }
 
-/// The deterministic identifier of a field's generated serde default-provider function. Derived
-/// from the owning type's dense id plus the field's Rust identifier, so it is stable across runs
-/// and cannot collide with a `PascalCase` type ident or another field's provider.
-fn default_provider_ident(
-    id: crate::ir::TypeId,
-    field_ident: &crate::name::Ident,
-) -> proc_macro2::Ident {
-    format_ident!(
-        "default_{}_{}",
-        id.0,
-        field_ident.as_str().trim_start_matches("r#")
+/// Whether an optional member keeps absence and `null` apart (`Option<Option<T>>` when nullable):
+/// always in a request model, and for a nullable member everywhere.
+fn field_presence(field: &Field, request_model: bool) -> bool {
+    !field.required && (request_model || field.ty.nullable)
+}
+
+/// The checked (de)serializer function names for a string-constant field: one generic pair per
+/// constant value (and per presence mode), shared by every field with that value.
+fn const_helper_idents(
+    names: &Names,
+    value: &str,
+    presence: bool,
+) -> (proc_macro2::Ident, proc_macro2::Ident) {
+    let stem = names
+        .const_checkers
+        .get(value)
+        .expect("constant checker allocated");
+    let stem = stem.as_str().trim_start_matches("r#");
+    let mode = if presence { "_present" } else { "" };
+    (
+        format_ident!("{}_de{}", stem, mode),
+        format_ident!("{}_ser", stem),
     )
 }
 
-/// Emit a field's serde default-provider function, when its `default` is a representable scalar
-/// wired through serde. The function returns `Option<T>` matching the (optional) field's Rust type.
-fn emit_default_provider(
-    id: crate::ir::TypeId,
-    field: &Field,
-    names: &Names,
-    options: &CodegenOptions,
-) -> Option<TokenStream> {
-    let applied = field.default.as_ref()?.applied.as_ref()?;
-    let field_ident = names
-        .fields
-        .get(&(id, field.name.wire.clone()))
-        .expect("field name allocated");
-    let fn_ident = default_provider_ident(id, field_ident);
-    let inner_ty = ty_tokens(field.ty, names, options, false);
-    let value = default_value_tokens(applied, field.ty, names);
-    Some(quote! {
-        fn #fn_ident() -> Option<#inner_ty> {
-            Some(#value)
+/// The checked (de)serializers for every string-constant field, plus the trait they share.
+fn emit_const_helpers(api: &Api, names: &Names, requests: &BTreeSet<TypeId>) -> TokenStream {
+    let mut used: BTreeSet<(String, bool)> = BTreeSet::new();
+    for (id, def) in api.types.iter() {
+        if !names.types.contains_key(&id) {
+            continue;
         }
-    })
-}
-
-/// Render a representable default as a Rust literal (or generated enum variant) for the field's
-/// Rust type.
-fn default_value_tokens(value: &crate::ir::DefaultValue, ty: Ty, names: &Names) -> TokenStream {
-    use crate::ir::DefaultValue;
-    match value {
-        DefaultValue::Bool(value) => quote! { #value },
-        DefaultValue::Int(value) => {
-            let literal = proc_macro2::Literal::i64_unsuffixed(*value);
-            quote! { #literal }
-        }
-        DefaultValue::Float(value) => {
-            let literal = proc_macro2::Literal::f64_unsuffixed(*value);
-            quote! { #literal }
-        }
-        DefaultValue::Str(value) => quote! { #value.to_owned() },
-        DefaultValue::EnumVariant(value) => {
-            let enum_ident = names.types.get(&ty.id).expect("enum type name allocated");
-            let variant_ident = names
-                .variants
-                .get(&(ty.id, value.clone()))
-                .expect("variant name allocated");
-            quote! { #enum_ident::#variant_ident }
+        let TypeKind::Struct(object) = &def.kind else {
+            continue;
+        };
+        for field in &object.fields {
+            if let Some(value) = names.consts.get(&field.ty.id) {
+                used.insert((value.clone(), field_presence(field, requests.contains(&id))));
+            }
         }
     }
+    if used.is_empty() {
+        return quote! {};
+    }
+    let values: BTreeSet<&String> = used.iter().map(|(value, _)| value).collect();
+    let serializers = values.iter().map(|value| {
+        let (_, ser) = const_helper_idents(names, value, false);
+        let error = format!("expected the constant {value:?}");
+        quote! {
+            fn #ser<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+                T: Serialize + ConstField,
+            {
+                if value.matches_const(#value) {
+                    value.serialize(serializer)
+                } else {
+                    Err(serde::ser::Error::custom(#error))
+                }
+            }
+        }
+    });
+    let deserializers = used.iter().map(|(value, presence)| {
+        let (de, _) = const_helper_idents(names, value, *presence);
+        let error = format!("expected the constant {value:?}");
+        let (output, read) = if *presence {
+            (
+                quote! { Option<T> },
+                quote! { deserialize_request_field(deserializer)? },
+            )
+        } else {
+            (quote! { T }, quote! { T::deserialize(deserializer)? })
+        };
+        quote! {
+            fn #de<'de, D, T>(deserializer: D) -> Result<#output, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+                T: Deserialize<'de> + ConstField,
+            {
+                let value = #read;
+                if value.matches_const(#value) {
+                    Ok(value)
+                } else {
+                    Err(serde::de::Error::custom(#error))
+                }
+            }
+        }
+    });
+    quote! {
+        // A string constant field holds a plain `String`; these check it against the constant.
+        // Absence and `null` stay governed by the field's own optionality and nullability.
+        trait ConstField {
+            fn matches_const(&self, expected: &str) -> bool;
+        }
+        impl ConstField for String {
+            fn matches_const(&self, expected: &str) -> bool {
+                self == expected
+            }
+        }
+        impl<T: ConstField> ConstField for Option<T> {
+            fn matches_const(&self, expected: &str) -> bool {
+                match self {
+                    Some(value) => value.matches_const(expected),
+                    None => true,
+                }
+            }
+        }
+        #(#serializers)*
+        #(#deserializers)*
+    }
+}
+
+/// Statements normalizing the JSON value `value` (a `mut serde_json::Value`) for a union variant of
+/// type `ty`, returning a deserialization error from the enclosing function when it is refused.
+fn variant_normalizer(api: &Api, names: &Names, ty: Ty) -> TokenStream {
+    let validation = super::normalize::Normalization { api, names };
+    let normalize = validation.normalizer(
+        Ty {
+            nullable: false,
+            ..ty
+        },
+        quote! { value },
+        0,
+    );
+    if normalize.is_empty() {
+        return quote! {};
+    }
+    quote! {
+        let mut value = value;
+        (|value: &mut serde_json::Value| -> Result<(), String> {
+            if value.is_null() {
+                return Ok(());
+            }
+            #normalize
+            Ok(())
+        })(&mut value)
+        .map_err(serde::de::Error::custom)?;
+    }
+}
+
+/// An `Option<#rust>` expression: the buffered `value` read as a trial-union variant of type `ty`,
+/// normalized first, so a variant matches exactly when the value decodes as it. With `strict` (a
+/// `bool` in scope) true, members and enum values the variant does not know count against it.
+/// The constants a variant of a union declares: each required property of an object whose type
+/// admits exactly one value (`const`, or an `enum` of one value), with that value. A variant that is
+/// itself a union declares the constants all of its own variants share.
+fn variant_constants(api: &Api, ty: Ty) -> Vec<(String, ScalarValue)> {
+    variant_constants_within(api, ty, &mut BTreeSet::new())
+}
+
+fn variant_constants_within(
+    api: &Api,
+    ty: Ty,
+    visiting: &mut BTreeSet<TypeId>,
+) -> Vec<(String, ScalarValue)> {
+    if !visiting.insert(ty.id) {
+        return Vec::new();
+    }
+    let constants = match api.types.get(ty.id).map(|def| &def.kind) {
+        Some(TypeKind::Struct(structure)) => structure
+            .fields
+            .iter()
+            .filter(|field| field.required && !field.ty.nullable)
+            .filter_map(
+                |field| match api.types.get(field.ty.id).map(|def| &def.kind) {
+                    Some(TypeKind::Enum(scalar)) if scalar.variants.len() == 1 => {
+                        Some((field.name.wire.clone(), scalar.variants[0].clone()))
+                    }
+                    _ => None,
+                },
+            )
+            .collect(),
+        Some(TypeKind::Union(union)) => {
+            let mut members = union
+                .variants
+                .iter()
+                .map(|variant| variant_constants_within(api, variant.ty, visiting));
+            let first = members.next().unwrap_or_default();
+            members.fold(first, |shared, other| {
+                shared
+                    .into_iter()
+                    .filter(|constant| other.contains(constant))
+                    .collect()
+            })
+        }
+        _ => Vec::new(),
+    };
+    visiting.remove(&ty.id);
+    constants
+}
+
+/// A boolean expression over `value`: whether it carries every constant of the variant `ty`;
+/// `None` for a variant without constants.
+fn constants_carried(api: &Api, ty: Ty) -> Option<TokenStream> {
+    let checks = variant_constants(api, ty)
+        .into_iter()
+        .map(|(wire, constant)| {
+            let read = match constant {
+                ScalarValue::String(text) => {
+                    quote! { .and_then(serde_json::Value::as_str) == Some(#text) }
+                }
+                ScalarValue::Int(number) => {
+                    quote! { .and_then(serde_json::Value::as_i64) == Some(#number) }
+                }
+                ScalarValue::Bool(flag) => {
+                    quote! { .and_then(serde_json::Value::as_bool) == Some(#flag) }
+                }
+            };
+            quote! { value.get(#wire) #read }
+        })
+        .collect::<Vec<_>>();
+    (!checks.is_empty()).then(|| quote! { #(#checks)&&* })
+}
+
+fn variant_attempt(api: &Api, names: &Names, ty: Ty, rust: &TokenStream) -> TokenStream {
+    let validation = super::normalize::Normalization { api, names };
+    let normalize = validation.normalizer(
+        Ty {
+            nullable: false,
+            ..ty
+        },
+        quote! { candidate },
+        0,
+    );
+    let normalize = if normalize.is_empty() {
+        quote! { let candidate = value.clone(); }
+    } else {
+        quote! {
+            let mut candidate = value.clone();
+            let normalized = (|candidate: &mut serde_json::Value| -> Result<(), String> {
+                if candidate.is_null() {
+                    return Ok(());
+                }
+                #normalize
+                Ok(())
+            })(&mut candidate);
+            if normalized.is_err() {
+                return None;
+            }
+        }
+    };
+    quote! {
+        (|| -> Option<#rust> {
+            #normalize
+            if strict {
+                super::support::strictly(|| serde_json::from_value::<#rust>(candidate)).ok()
+            } else {
+                serde_json::from_value::<#rust>(candidate).ok()
+            }
+        })()
+    }
+}
+
+/// The variant holding an unlisted value of an open enum: `Unknown`, or the first free
+/// `Unknown<n>` when the contract already lists a value named that way.
+fn unknown_variant_ident<'a>(taken: impl Iterator<Item = &'a str>) -> proc_macro2::Ident {
+    let taken: BTreeSet<&str> = taken.collect();
+    let name = std::iter::once("Unknown".to_owned())
+        .chain((2..).map(|index| format!("Unknown{index}")))
+        .find(|name| !taken.contains(name.as_str()))
+        .expect("a free name");
+    format_ident!("{}", name)
+}
+
+/// The types an XML request or response body reaches.
+fn xml_types(api: &Api) -> std::collections::HashSet<TypeId> {
+    let mut stack: Vec<TypeId> = Vec::new();
+    for operation in &api.operations {
+        if let Some(body) = operation.request_body.as_ref() {
+            if body.media == MediaType::Xml {
+                stack.extend(body.ty.map(|ty| ty.id));
+            }
+        }
+        for response in operation
+            .responses
+            .by_status
+            .iter()
+            .map(|(_, response)| response)
+            .chain(operation.responses.default.as_ref())
+        {
+            if response.media == Some(MediaType::Xml) {
+                stack.extend(response.body.map(|ty| ty.id));
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match api.types.get(id).map(|def| &def.kind) {
+            Some(TypeKind::Struct(object)) => {
+                stack.extend(object.fields.iter().map(|field| field.ty.id));
+                if let AdditionalProps::Typed(ty) = &object.additional {
+                    stack.push(ty.id);
+                }
+            }
+            Some(TypeKind::Array(ty)) => stack.push(ty.id),
+            Some(TypeKind::Tuple(items)) => stack.extend(items.iter().map(|ty| ty.id)),
+            Some(TypeKind::Union(union)) => {
+                stack.extend(union.variants.iter().map(|variant| variant.ty.id));
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// The deserializer that normalizes a field's JSON before decoding it, named by its content so equal
+/// helpers (and the models that use them) share one item.
+pub(crate) fn emit_field_helper(
+    field: &Field,
+    api: &Api,
+    names: &Names,
+    options: &CodegenOptions,
+    request_model: bool,
+) -> Option<(proc_macro2::Ident, TokenStream)> {
+    if names.consts.contains_key(&field.ty.id) {
+        return None;
+    }
+    let validation = super::normalize::Normalization { api, names };
+    let normalize = validation.normalizer(
+        Ty {
+            nullable: false,
+            ..field.ty
+        },
+        quote! { value },
+        0,
+    );
+    if normalize.is_empty() {
+        return None;
+    }
+    let ty = ty_tokens(field.ty, names, options, false);
+    let (output, inner, wrap) = if field.required {
+        (ty.clone(), ty, quote! {})
+    } else if field_presence(field, request_model) {
+        (quote! { Option<#ty> }, ty, quote! { .map(Some) })
+    } else {
+        (quote! { Option<#ty> }, quote! { Option<#ty> }, quote! {})
+    };
+    Some(normalizing_helper(output, inner, wrap, normalize))
+}
+
+/// The deserializer that normalizes the members a struct does not declare (its typed overflow map)
+/// before decoding them, named by its content like [`emit_field_helper`].
+pub(crate) fn emit_overflow_helper(
+    item: Ty,
+    api: &Api,
+    names: &Names,
+    options: &CodegenOptions,
+) -> Option<(proc_macro2::Ident, TokenStream)> {
+    let validation = super::normalize::Normalization { api, names };
+    let normalize = validation.normalizer(item, quote! { v0 }, 1);
+    if normalize.is_empty() {
+        return None;
+    }
+    let ty = ty_tokens(item, names, options, false);
+    let map = quote! { BTreeMap<String, #ty> };
+    let normalize = quote! {
+        if let serde_json::Value::Object(members) = &mut *value {
+            for v0 in members.values_mut() {
+                #normalize
+            }
+        }
+    };
+    Some(normalizing_helper(map.clone(), map, quote! {}, normalize))
+}
+
+/// A deserializer for `output` that normalizes the JSON with `normalize` (statements over
+/// `value: &mut serde_json::Value`), decodes it as `inner` and applies `wrap`.
+fn normalizing_helper(
+    output: TokenStream,
+    inner: TokenStream,
+    wrap: TokenStream,
+    normalize: TokenStream,
+) -> (proc_macro2::Ident, TokenStream) {
+    let key = {
+        let text = format!("{output}|{inner}|{wrap}|{normalize}");
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in text.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        hash
+    };
+    let helper = format_ident!("deserialize_{key:016x}");
+    let tokens = quote! {
+        fn #helper<'de, D>(deserializer: D) -> Result<#output, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            fn normalize(value: &mut serde_json::Value) -> Result<(), String> {
+                if value.is_null() {
+                    return Ok(());
+                }
+                #normalize
+                Ok(())
+            }
+            super::support::deserialize_normalized::<D, #inner>(deserializer, normalize)#wrap
+        }
+    };
+    (helper, tokens)
 }
 
 fn type_kind_tokens(
@@ -2938,7 +3780,8 @@ fn type_kind_tokens(
         }
         TypeKind::Tuple(items) => {
             let items = items.iter().map(|ty| ty_tokens(*ty, names, options, false));
-            quote! { (#(#items),*) }
+            // A trailing comma keeps a one-element tuple a tuple.
+            quote! { (#(#items,)*) }
         }
         TypeKind::Bytes => quote! { bytes::Bytes },
         TypeKind::Null => quote! { () },
@@ -2949,12 +3792,22 @@ fn type_kind_tokens(
     }
 }
 
-fn ty_tokens(ty: Ty, names: &Names, _options: &CodegenOptions, qualified: bool) -> TokenStream {
-    let ident = names.types.get(&ty.id).expect("type name allocated");
-    let mut tokens = if qualified {
-        quote! { types::#ident }
-    } else {
-        quote! { #ident }
+pub(crate) fn ty_tokens(
+    ty: Ty,
+    names: &Names,
+    options: &CodegenOptions,
+    qualified: bool,
+) -> TokenStream {
+    let mut tokens = match names.inline.get(&ty.id) {
+        Some(kind) => inline_kind_tokens(kind, names, options, qualified),
+        None => {
+            let ident = names.types.get(&ty.id).expect("type name allocated");
+            if qualified {
+                quote! { types::#ident }
+            } else {
+                quote! { #ident }
+            }
+        }
     };
     if ty.boxed {
         tokens = quote! { Box<#tokens> };
@@ -2963,6 +3816,95 @@ fn ty_tokens(ty: Ty, names: &Names, _options: &CodegenOptions, qualified: bool) 
         tokens = quote! { Option<#tokens> };
     }
     tokens
+}
+
+/// A union's `Serialize` impl around its strategy-specific `body` (which writes to `serializer`).
+/// With constraint checks, the body renders into a JSON value first, and the value must pass every
+/// check before it is written.
+fn union_serialize_impl(
+    ident: &crate::name::Ident,
+    body: TokenStream,
+    constraint_checks: &[TokenStream],
+) -> TokenStream {
+    if constraint_checks.is_empty() {
+        return quote! {
+            impl serde::Serialize for #ident {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    #body
+                }
+            }
+        };
+    }
+    quote! {
+        impl serde::Serialize for #ident {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                let rendered = (|| -> Result<serde_json::Value, serde_json::Error> {
+                    #[allow(unused_variables)]
+                    let serializer = serde_json::value::Serializer;
+                    #body
+                })();
+                let value = rendered.map_err(serde::ser::Error::custom)?;
+                let checked = (|| -> Result<(), serde_json::Error> {
+                    #(#constraint_checks)*
+                    Ok(())
+                })();
+                checked.map_err(serde::ser::Error::custom)?;
+                value.serialize(serializer)
+            }
+        }
+    }
+}
+
+/// The Rust spelling of an inline (unnamed structural) type. Element types recurse through
+/// [`ty_tokens`] so a named element keeps its `types::` qualification at the crate root.
+fn inline_kind_tokens(
+    kind: &TypeKind,
+    names: &Names,
+    options: &CodegenOptions,
+    qualified: bool,
+) -> TokenStream {
+    match kind {
+        TypeKind::Primitive(prim) => prim_tokens(*prim, options),
+        TypeKind::Array(item) => {
+            let item = ty_tokens(**item, names, options, qualified);
+            quote! { Vec<#item> }
+        }
+        TypeKind::Tuple(items) => {
+            let items = items
+                .iter()
+                .map(|ty| ty_tokens(*ty, names, options, qualified));
+            // A trailing comma keeps a one-element tuple a tuple.
+            quote! { (#(#items,)*) }
+        }
+        TypeKind::Bytes => quote! { bytes::Bytes },
+        TypeKind::Null => quote! { () },
+        TypeKind::Any => quote! { serde_json::Value },
+        TypeKind::Enum(enumeration) => match enumeration.repr {
+            // Only a field-only string constant is inline; its field checks the value.
+            ScalarRepr::String => quote! { String },
+            ScalarRepr::Int => quote! { i64 },
+            ScalarRepr::Bool => quote! { bool },
+        },
+        // A map-only object: exactly the overflow map a named wrapper struct would flatten.
+        TypeKind::Struct(object) => match &object.additional {
+            AdditionalProps::Typed(value) => {
+                let value = ty_tokens(**value, names, options, qualified);
+                quote! { std::collections::BTreeMap<String, #value> }
+            }
+            AdditionalProps::Allow | AdditionalProps::Deny => {
+                unreachable!("only map-only objects are inline")
+            }
+        },
+        TypeKind::Never | TypeKind::Union(_) => {
+            unreachable!("nominal types are always named")
+        }
+    }
 }
 
 /// Union payloads are uniformly indirect so an API's largest object variant cannot inflate every

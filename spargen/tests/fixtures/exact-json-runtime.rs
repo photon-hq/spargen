@@ -1,0 +1,152 @@
+#[cfg(test)]
+mod exact_json_tests {
+    use super::types;
+    use serde_json::{json, Value};
+
+    fn item() -> Value {
+        json!({"name": "ab", "count": 4, "at": "2024-01-01T00:00:00Z"})
+    }
+
+    fn decode(value: Value) -> Result<types::Item, String> {
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    }
+
+    fn accepts(field: &str, value: Value) {
+        let mut input = item();
+        input[field] = value;
+        let decoded = decode(input.clone()).unwrap_or_else(|error| panic!("{field}: {error}"));
+        let output = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(output[field], input[field], "{field} round-trips");
+    }
+
+    #[test]
+    fn integers_accept_integral_numbers() {
+        let decoded = decode(json!({"name": "ab", "count": 4.0, "at": "2024-01-01T00:00:00Z"}));
+        assert_eq!(decoded.unwrap().count, 4);
+        let mut input = item();
+        input["count"] = json!(4.5);
+        assert!(decode(input).is_err());
+        accepts("status", json!(404));
+        // Validation-only keywords are the server's to enforce.
+        accepts("count", json!(-3));
+        accepts("name", json!("a b c d"));
+    }
+
+    #[test]
+    fn open_prefix_items_and_typed_maps() {
+        accepts("prefix", json!([]));
+        accepts("prefix", json!(["*", 5, {}]));
+        let mut input = item();
+        input["limits"] = json!({"cap": 20.0, "x": 2.0});
+        let decoded = decode(input).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap()["limits"], json!({"cap": 20, "x": 2}));
+    }
+
+    #[test]
+    fn presence_null_and_open_objects() {
+        accepts("nickname", Value::Null);
+        let mut missing = item();
+        missing.as_object_mut().unwrap().remove("name");
+        assert!(decode(missing).is_err());
+        // Members the schema does not declare are kept.
+        let mut open = item();
+        open["extra"] = json!({"nested": [1, 2]});
+        let decoded = decode(open.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), open);
+    }
+
+    #[test]
+    fn response_models_keep_null_and_tolerate_it() {
+        let summary: types::Summary =
+            serde_json::from_value(json!({"id": "a", "flag": null, "note": null, "count": 2.0}))
+                .unwrap();
+        assert_eq!(summary.flag, None);
+        assert_eq!(summary.note, None);
+        assert_eq!(summary.count, Some(2));
+        // A decoded value serializes back unchanged.
+        let value = json!({"id": "a", "flag": "x", "count": 1});
+        let summary: types::Summary = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(summary).unwrap(), value);
+        let missing_flag: types::Summary = serde_json::from_value(json!({"id": "a"})).unwrap();
+        assert_eq!(missing_flag.flag, None);
+    }
+
+    #[test]
+    fn date_times_accept_every_rfc_3339_spelling() {
+        for text in [
+            "2024-01-01T00:00:00.5+05:30",
+            "2024-01-01t00:00:00z",
+            "2024-01-01T00:00Z",
+            "0000-01-01T00:00:00Z",
+        ] {
+            let mut input = item();
+            input["at"] = json!(text);
+            assert!(decode(input).is_ok(), "{text}");
+        }
+        // A pattern requiring milliseconds keeps three digits.
+        accepts("stamp", json!("2024-01-01T00:00:00.910Z"));
+        let mut input = item();
+        input["stamp"] = json!("2024-01-01T00:00Z");
+        assert!(decode(input).is_ok());
+    }
+
+    #[test]
+    fn unknown_members_are_tolerated_but_still_pick_the_variant() {
+        // A closed object ignores a member it does not declare.
+        let mut input = item();
+        input["closed"] = json!({"a": "x", "later": true});
+        let decoded = decode(input).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap()["closed"], json!({"a": "x"}));
+        // Undeclared members still tell `oneOf` variants apart.
+        let pick: types::Pick = serde_json::from_value(json!({"b": "y"})).unwrap();
+        assert!(matches!(pick, types::Pick::Berry(_)));
+        let pick: types::Pick = serde_json::from_value(json!({"a": "x"})).unwrap();
+        assert!(matches!(pick, types::Pick::Apple(_)));
+        // With an addition neither variant knows, the value still decodes.
+        let pick: types::Pick = serde_json::from_value(json!({"b": "y", "later": 1})).unwrap();
+        assert!(matches!(pick, types::Pick::Berry(_)));
+    }
+
+    #[test]
+    fn response_enums_are_open() {
+        let summary: types::Summary =
+            serde_json::from_value(json!({"id": "a", "flag": null, "state": "archived"})).unwrap();
+        assert_eq!(summary.state, Some(types::State::Unknown2("archived".to_owned())));
+        assert_eq!(serde_json::to_value(&summary).unwrap()["state"], "archived");
+        let summary: types::Summary =
+            serde_json::from_value(json!({"id": "a", "flag": null, "state": "unknown"})).unwrap();
+        assert_eq!(summary.state, Some(types::State::Unknown));
+        assert_eq!(types::State::Open.to_string(), "open");
+        // A request-only enum lists exactly the contract's values.
+        assert!(serde_json::from_value::<types::Order>(json!("random")).is_err());
+    }
+
+    #[test]
+    fn unions_told_apart_only_by_validation_keywords_are_their_scalar() {
+        // Mailbox's `oneOf` string branches differ only in `pattern`, so it is a plain string
+        // rather than an enum whose every value matches both branches.
+        let address: types::Mailbox = String::from("a@b.example");
+        accepts("address", json!(address));
+        accepts("address", json!("not checked by the client"));
+        // Likewise integer branches that differ only in bounds, with `null` kept.
+        let mut input = item();
+        input["code"] = json!(-3);
+        assert_eq!(decode(input).unwrap().code, Some(Some(-3)));
+        accepts("code", json!(12));
+        accepts("code", Value::Null);
+    }
+
+    #[test]
+    fn enums_a_response_union_constraint_carries_are_open() {
+        // Tier is also a request parameter, but a Graded response checks it through its
+        // constraint, so a tier added later still decodes.
+        let value = json!({"k": "x", "tier": "bronze"});
+        let graded: types::Graded = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(graded, types::Graded::Kiwi(_)));
+        assert_eq!(serde_json::to_value(&graded).unwrap(), value);
+        assert_eq!(
+            serde_json::from_value::<types::Tier>(json!("bronze")).unwrap(),
+            types::Tier::Unknown("bronze".to_owned())
+        );
+    }
+}
