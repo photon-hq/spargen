@@ -962,7 +962,9 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         let mut union = schema.clone();
         union.boolean = None;
         union.reference = None;
-        union.types.types.retain(|ty| *ty == JsonType::Null);
+        // A `"null"` in the array becomes a null-only member, which makes the union nullable. Kept
+        // as the union's own `type`, it would be a sibling constraint no other member satisfies.
+        union.types.types.clear();
         union.properties.clear();
         union.required.clear();
         union.additional_properties = None;
@@ -971,7 +973,7 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         union.prefix_items.clear();
         union.all_of.clear();
         union.one_of.clear();
-        union.any_of = branches;
+        union.any_of.clear();
         union.discriminator = None;
         union.enum_values = None;
         union.const_value = None;
@@ -981,6 +983,14 @@ impl<'a, 'doc> LowerCtx<'a, 'doc> {
         union.content_schema = None;
         union.xml = None;
         union.validation = ValidationKeywords::default();
+        if schema.types.types.contains(&JsonType::Null) {
+            let mut null = union.clone();
+            null.types.types = vec![JsonType::Null];
+            null.title = None;
+            null.description = None;
+            branches.push(SchemaOr::Schema(Box::new(null)));
+        }
+        union.any_of = branches;
         self.lower_union(&union, hint)
     }
 

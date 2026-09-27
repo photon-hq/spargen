@@ -988,6 +988,17 @@ fn overlapping_unions_enforce_one_of_and_canonicalize_any_of() {
 }
 
 #[test]
+fn a_type_array_of_scalars_and_null_is_a_nullable_union() {
+    use basic_client::types::MixedCode;
+    for json in [serde_json::json!(7), serde_json::json!("seven"), serde_json::Value::Null] {
+        let code: Option<MixedCode> = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(code.is_none(), json.is_null());
+        assert_eq!(serde_json::to_value(&code).unwrap(), json);
+    }
+    assert!(serde_json::from_value::<Option<MixedCode>>(serde_json::json!(true)).is_err());
+}
+
+#[test]
 fn mixed_discriminator_dispatches_arrays_by_category_and_objects_by_tag() {
     let directory: basic_client::types::MixedContent =
         serde_json::from_str(r#"["README.md"]"#).unwrap();
@@ -2531,6 +2542,9 @@ components:
       anyOf:
         - $ref: "#/components/schemas/BroadOwner"
         - $ref: "#/components/schemas/DetailedOwner"
+    # A type array of several scalars and null: a nullable union of the scalars.
+    MixedCode:
+      type: [integer, string, "null"]
     ContentFile:
       type: object
       required: [type, content]
@@ -2607,6 +2621,8 @@ components:
           $ref: "#/components/schemas/OneOverlap"
         any_owner:
           $ref: "#/components/schemas/AnyOwner"
+        mixed_code:
+          $ref: "#/components/schemas/MixedCode"
         mixed_content:
           $ref: "#/components/schemas/MixedContent"
     # Discriminated union: `petType` selects the object variant. Cat DECLARES `petType` as a required
