@@ -40,6 +40,8 @@ where
     match from_xml_bytes::<T>(&body) {
         Ok(value) => Ok(ResponseValue::new(status, headers, value)),
         Err(path) => Err(Error::Decode {
+            status,
+            headers,
             path,
             body,
             truncated: false,
@@ -68,6 +70,8 @@ where
         match from_xml_bytes::<E>(&body) {
             Ok(value) => Error::Api(ResponseValue::new(status, headers, value)),
             Err(path) => Error::Decode {
+                status,
+                headers,
                 path,
                 body,
                 truncated,

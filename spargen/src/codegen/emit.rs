@@ -731,7 +731,9 @@ pub(crate) fn emit_operation(
                 .responses
                 .by_status
                 .iter()
-                .filter(|(status, response)| !status.is_success() && response.body.is_some())
+                .filter(|(status, response)| {
+                    !operation.responses.is_success_side(*status) && response.body.is_some()
+                })
                 .map(|(status, _)| match status {
                     crate::ir::StatusSpec::Exact(code) => {
                         quote! { support::StatusSpec::Exact(#code) }
@@ -824,6 +826,8 @@ pub(crate) fn emit_operation(
                                         #error_ident::#variant_ident(value),
                                     )),
                                     Err(path) => support::Error::Decode {
+                                        status,
+                                        headers,
                                         path,
                                         body,
                                         truncated,
@@ -913,6 +917,8 @@ pub(crate) fn emit_operation(
                             if #spec_tokens.matches(status) {
                                 let value = #decode
                                     .map_err(|path| support::Error::<#error_ty>::Decode {
+                                        status,
+                                        headers: headers.clone(),
                                         path,
                                         body: body.clone(),
                                         truncated: false,
@@ -957,6 +963,15 @@ pub(crate) fn emit_operation(
         .responses
         .stream_success()
         .map(|(framing, _)| framing);
+    // A documented `304 Not Modified` is a success-side outcome, decoded with the 2xx statuses.
+    let is_success = if operation.responses.not_modified_is_outcome() {
+        quote! {
+            response.status().is_success()
+                || response.status() == reqwest::StatusCode::NOT_MODIFIED
+        }
+    } else {
+        quote! { response.status().is_success() }
+    };
     let success_decode = match stream_framing {
         Some(framing) => {
             let framing_tokens = match framing {
@@ -1044,7 +1059,7 @@ pub(crate) fn emit_operation(
             let response = support::send(&self.core, #request_binding)
                 .await
                 .map_err(support::Error::widen)?;
-            if response.status().is_success() {
+            if #is_success {
                 #success_decode
             } else {
                 #error_branch
@@ -2771,7 +2786,7 @@ fn emit_type_def(
                             .variants
                             .get(&(id, variant.name_hint.clone()))
                             .expect("union variant name allocated");
-                        let ty = union_variant_ty_tokens(variant.ty, names, options);
+                        let ty = union_variant_ty_tokens(union, variant.ty, names, options);
                         quote! { #variant_ident(#ty), }
                     });
                     let category_arms =
@@ -2930,7 +2945,7 @@ fn emit_type_def(
                             .variants
                             .get(&(id, variant.name_hint.clone()))
                             .expect("union variant name allocated");
-                        let ty = union_variant_ty_tokens(variant.ty, names, options);
+                        let ty = union_variant_ty_tokens(union, variant.ty, names, options);
                         quote! { #variant_ident(#ty), }
                     });
                     let de_arms = union
@@ -3018,7 +3033,7 @@ fn emit_type_def(
                             .variants
                             .get(&(id, variant.name_hint.clone()))
                             .expect("union variant name allocated");
-                        let ty = union_variant_ty_tokens(variant.ty, names, options);
+                        let ty = union_variant_ty_tokens(union, variant.ty, names, options);
                         quote! { #variant_ident(#ty), }
                     });
                     let attempts =
@@ -3031,7 +3046,7 @@ fn emit_type_def(
                                     .variants
                                     .get(&(id, variant.name_hint.clone()))
                                     .expect("union variant name allocated");
-                                let ty = union_variant_ty_tokens(variant.ty, names, options);
+                                let ty = union_variant_ty_tokens(union, variant.ty, names, options);
                                 let mut attempt = variant_attempt(api, names, variant.ty, &ty);
                                 // In the keyed pass only the variants whose constants the value
                                 // carries are tried.
@@ -3076,7 +3091,7 @@ fn emit_type_def(
                         }
                     });
                     let validations = union.variants.iter().map(|variant| {
-                        let ty = union_variant_ty_tokens(variant.ty, names, options);
+                        let ty = union_variant_ty_tokens(union, variant.ty, names, options);
                         let attempt = variant_attempt(api, names, variant.ty, &ty);
                         quote! {
                             if #attempt.is_some() {
@@ -3920,7 +3935,33 @@ fn inline_kind_tokens(
 /// Union payloads are uniformly indirect so an API's largest object variant cannot inflate every
 /// value of the enum (or trip strict `large_enum_variant` linting). Existing recursive boxing is a
 /// boolean representation flag, so setting it again never produces `Box<Box<T>>`.
-fn union_variant_ty_tokens(ty: Ty, names: &Names, options: &CodegenOptions) -> TokenStream {
+///
+/// A member of plain `number` type in a union with no plain `integer` member holds a
+/// [`serde_json::Number`] rather than an `f64`: it is selected for every JSON number, and an `f64`
+/// would turn an integer such as `1` into `1.0` when the value is serialized again. Beside an
+/// `integer` member it stays `f64`, since integers select that member instead.
+fn union_variant_ty_tokens(
+    union: &crate::ir::Union,
+    ty: Ty,
+    names: &Names,
+    options: &CodegenOptions,
+) -> TokenStream {
+    let inline_prim = |ty: Ty| match names.inline.get(&ty.id) {
+        Some(TypeKind::Primitive(prim)) => Some(*prim),
+        _ => None,
+    };
+    let takes_integers = union
+        .variants
+        .iter()
+        .any(|variant| matches!(inline_prim(variant.ty), Some(Prim::I32 | Prim::I64)));
+    if inline_prim(ty) == Some(Prim::F64) && !takes_integers {
+        let number = quote! { Box<serde_json::Number> };
+        return if ty.nullable {
+            quote! { Option<#number> }
+        } else {
+            number
+        };
+    }
     ty_tokens(Ty { boxed: true, ..ty }, names, options, false)
 }
 

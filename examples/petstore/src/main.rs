@@ -1,6 +1,7 @@
 //! Drives the generated petstore client end to end against a local mock server: typed models,
-//! query/header/path parameters, JSON bodies, bearer auth, typed API errors, undocumented-status
-//! handling, the transient-failure classifier, and the bring-your-own-policy retry adapter.
+//! query/header/path parameters, JSON bodies, bearer auth, typed API errors, undecodable error
+//! bodies, undocumented-status handling, the transient-failure classifier, and the
+//! bring-your-own-policy retry adapter.
 //! Everything runs on 127.0.0.1 — no external API, no real credentials.
 
 use std::future::Future;
@@ -130,6 +131,19 @@ async fn main() {
             println!("typed 404: {}", response.into_inner().message);
         }
         other => panic!("expected a typed 404, got {other:?}"),
+    }
+
+    // A documented status whose body is not the documented shape (here a proxy's plain-text page)
+    // is a decode error that still carries the status and headers, so the request ID survives.
+    match client.get_pet("proxied".to_owned()).await {
+        Err(Error::Decode {
+            status, headers, ..
+        }) => {
+            assert_eq!(status, 404);
+            assert_eq!(headers["x-request-id"], "req_proxied");
+            println!("undecodable 404 kept its status and request ID");
+        }
+        other => panic!("expected a decode error, got {other:?}"),
     }
 
     // A multipart body with an Encoding Object: each part is sent with the Content-Type the spec
@@ -326,6 +340,12 @@ fn handle(mut stream: TcpStream) {
                         r#"{"id":"flaky","name":"Comet","status":"available"}"#.to_owned(),
                     )
                 }
+            }
+            // A documented status with a body that is not the documented JSON, as an
+            // intermediary's error page would be.
+            ("GET", "/pets/proxied") => {
+                extra_headers.push_str("X-Request-ID: req_proxied\r\n");
+                ("404 Not Found", "404 page not found".to_owned())
             }
             ("GET", _) => ("404 Not Found", r#"{"message":"no such pet"}"#.to_owned()),
             ("DELETE", "/pets/1") => ("204 No Content", String::new()),

@@ -242,12 +242,16 @@ where
     let status = response.status();
     let headers = response.headers().clone();
     let body = response.bytes().await.map_err(Error::from_reqwest)?;
-    let value = serde_json::from_slice::<T>(&body).map_err(|error| Error::Decode {
-        path: error.to_string(),
-        body,
-        truncated: false,
-    })?;
-    Ok(ResponseValue::new(status, headers, value))
+    match serde_json::from_slice::<T>(&body) {
+        Ok(value) => Ok(ResponseValue::new(status, headers, value)),
+        Err(error) => Err(Error::Decode {
+            status,
+            headers,
+            path: error.to_string(),
+            body,
+            truncated: false,
+        }),
+    }
 }
 
 /// Decode a raw UTF-8 success body as the JSON string value described by a textual OpenAPI media
@@ -263,12 +267,16 @@ where
     let status = response.status();
     let headers = response.headers().clone();
     let body = response.bytes().await.map_err(Error::from_reqwest)?;
-    let value = decode_text_body::<T>(&body).map_err(|path| Error::Decode {
-        path,
-        body,
-        truncated: false,
-    })?;
-    Ok(ResponseValue::new(status, headers, value))
+    match decode_text_body::<T>(&body) {
+        Ok(value) => Ok(ResponseValue::new(status, headers, value)),
+        Err(path) => Err(Error::Decode {
+            status,
+            headers,
+            path,
+            body,
+            truncated: false,
+        }),
+    }
 }
 
 /// Decode a raw binary success body without attempting JSON deserialization.
@@ -364,6 +372,8 @@ where
                 match serde_json::from_slice::<E>(&body) {
                     Ok(value) => Error::Api(ResponseValue::new(status, headers, value)),
                     Err(error) => Error::Decode {
+                        status,
+                        headers,
                         path: error.to_string(),
                         body,
                         truncated,
@@ -398,6 +408,8 @@ where
                 match decode_text_body::<E>(&body) {
                     Ok(value) => Error::Api(ResponseValue::new(status, headers, value)),
                     Err(path) => Error::Decode {
+                        status,
+                        headers,
                         path,
                         body,
                         truncated,
@@ -739,8 +751,9 @@ mod tests {
     use std::convert::Infallible;
 
     use super::{
-        classify_error_bytes, classify_error_text, decode_success_bytes, decode_success_text,
-        decode_text_body, read_error_body, read_success_body,
+        classify_error, classify_error_bytes, classify_error_text, decode_success,
+        decode_success_bytes, decode_success_text, decode_text_body, read_error_body,
+        read_success_body,
     };
     use crate::{Error, ResponseValue};
 
@@ -868,6 +881,8 @@ mod tests {
         if StatusSpec::Exact(200).matches(status) {
             let value =
                 serde_json::from_slice::<Created>(&body).map_err(|error| Error::Decode {
+                    status,
+                    headers: headers.clone(),
                     path: error.to_string(),
                     body: body.clone(),
                     truncated: false,
@@ -881,6 +896,8 @@ mod tests {
         if StatusSpec::Exact(202).matches(status) {
             let value =
                 serde_json::from_slice::<Accepted>(&body).map_err(|error| Error::Decode {
+                    status,
+                    headers: headers.clone(),
                     path: error.to_string(),
                     body: body.clone(),
                     truncated: false,
@@ -959,6 +976,8 @@ mod tests {
                     ApiError::Status409(value),
                 )),
                 Err(error) => Error::Decode {
+                    status,
+                    headers,
                     path: error.to_string(),
                     body,
                     truncated,
@@ -973,6 +992,8 @@ mod tests {
                     ApiError::Status4xx(value),
                 )),
                 Err(error) => Error::Decode {
+                    status,
+                    headers,
                     path: error.to_string(),
                     body,
                     truncated,
@@ -1024,5 +1045,47 @@ mod tests {
     fn error_dispatch_parse_failure_is_decode() {
         let error = dispatch_error(json_response(409, "not json"));
         assert!(matches!(error, Error::Decode { .. }));
+    }
+
+    #[test]
+    fn classify_error_decode_failure_keeps_status_and_headers() {
+        // A documented status whose body is not the documented shape (an intermediary's plain-text
+        // 502, say) must still report the status and the request-ID header.
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(502)
+                .header("content-type", "text/plain")
+                .header("x-request-id", "req_gateway")
+                .body("error code: 502".to_owned())
+                .expect("valid synthetic response"),
+        );
+        let error = poll_ready(classify_error::<Conflict>(
+            &core(),
+            response,
+            &[StatusSpec::Exact(502)],
+        ));
+        match error {
+            Error::Decode {
+                status,
+                headers,
+                body,
+                ..
+            } => {
+                assert_eq!(status, 502);
+                assert_eq!(headers["x-request-id"], "req_gateway");
+                assert_eq!(body.as_ref(), b"error code: 502");
+            }
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_success_failure_keeps_status_and_headers() {
+        let error = poll_ready(decode_success::<Created>(
+            &core(),
+            json_response(200, "not json"),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, Error::Decode { status, .. } if status == 200));
     }
 }

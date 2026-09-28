@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
-use reqwest::{Request, Response};
+use reqwest::header::HeaderMap;
+use reqwest::{Request, Response, StatusCode};
 use serde::de::DeserializeOwned;
 
 use crate::{send, unexpected_status, ClientCore, Error, MaybeSend, MaybeSync, TransportError};
@@ -108,6 +109,10 @@ pub struct EventStream<T> {
     last_event_id: Option<String>,
     reconnect_delay: Option<Duration>,
     reconnect: Option<ReconnectContext>,
+    /// The status and headers of the response currently being read, carried by a per-frame
+    /// [`Error::Decode`].
+    status: StatusCode,
+    headers: HeaderMap,
     /// `T` is produced, never consumed; the `fn() -> T` marker keeps `T` from imposing unrelated
     /// auto-trait bounds on the stream.
     _marker: PhantomData<fn() -> T>,
@@ -138,6 +143,8 @@ impl<T> EventStream<T> {
     /// consumed lazily — no bytes are read until the first [`Self::next`] call.
     pub fn new(response: Response, framing: Framing) -> Self {
         Self {
+            status: response.status(),
+            headers: response.headers().clone(),
             state: StreamState::Body(Box::pin(response.bytes_stream())),
             buffer: Vec::new(),
             framing,
@@ -164,6 +171,8 @@ impl<T> EventStream<T> {
                 .map(str::to_owned)
         });
         Self {
+            status: response.status(),
+            headers: response.headers().clone(),
             state: StreamState::Body(Box::pin(response.bytes_stream())),
             buffer: Vec::new(),
             framing,
@@ -225,7 +234,7 @@ impl<T: DeserializeOwned> Stream for EventStream<T> {
             match next_frame(&mut this.buffer, this.framing, at_eof) {
                 FramePoll::Item { payload, metadata } => {
                     this.apply_metadata(metadata);
-                    let item = deserialize_item::<T>(&payload);
+                    let item = deserialize_item::<T>(&payload, this.status, &this.headers);
                     if item.is_ok() {
                         if let Some(reconnect) = this.reconnect.as_mut() {
                             reconnect.attempt = 0;
@@ -293,6 +302,8 @@ impl<T: DeserializeOwned> Stream for EventStream<T> {
                         return Poll::Pending;
                     }
                     Poll::Ready(Ok(response)) => {
+                        this.status = response.status();
+                        this.headers = response.headers().clone();
                         this.state = StreamState::Body(Box::pin(response.bytes_stream()));
                     }
                     Poll::Ready(Err(error)) => {
@@ -642,9 +653,15 @@ fn take_line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
 }
 
 /// Decode one framed JSON payload into `T`. A parse failure becomes [`Error::Decode`] carrying the
-/// serde path and the raw frame — never a silent skip.
-fn deserialize_item<T: DeserializeOwned>(payload: &[u8]) -> Result<T, Error<Infallible>> {
+/// carrying response's status and headers, the serde path, and the raw frame — never a silent skip.
+fn deserialize_item<T: DeserializeOwned>(
+    payload: &[u8],
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Result<T, Error<Infallible>> {
     serde_json::from_slice::<T>(payload).map_err(|error| Error::Decode {
+        status,
+        headers: headers.clone(),
         path: error.to_string(),
         body: Bytes::copy_from_slice(payload),
         truncated: false,
@@ -859,14 +876,22 @@ mod tests {
         let (items, _) = drain(&mut buf, Framing::Ndjson, false);
         assert_eq!(items, vec!["not json"]);
         let decoded: Result<serde_json::Value, Error<std::convert::Infallible>> =
-            super::deserialize_item(items[0].as_bytes());
+            super::deserialize_item(
+                items[0].as_bytes(),
+                reqwest::StatusCode::OK,
+                &reqwest::header::HeaderMap::new(),
+            );
         assert!(matches!(decoded, Err(Error::Decode { .. })));
     }
 
     #[test]
     fn well_formed_json_frame_deserializes() {
         let decoded: Result<serde_json::Value, Error<std::convert::Infallible>> =
-            super::deserialize_item(br#"{"a":1}"#);
+            super::deserialize_item(
+                br#"{"a":1}"#,
+                reqwest::StatusCode::OK,
+                &reqwest::header::HeaderMap::new(),
+            );
         assert_eq!(decoded.unwrap(), serde_json::json!({"a": 1}));
     }
 
@@ -1060,7 +1085,11 @@ mod tests {
         let mut stream: EventStream<serde_json::Value> =
             EventStream::new(response("not json\n"), Framing::Ndjson);
         let item = poll_ready(stream.next()).unwrap();
-        assert!(matches!(item, Err(Error::Decode { .. })));
+        // The error carries the status of the response that delivered the malformed frame.
+        assert!(matches!(
+            item,
+            Err(Error::Decode { status, .. }) if status == reqwest::StatusCode::OK
+        ));
     }
 
     #[test]

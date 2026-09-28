@@ -88,6 +88,7 @@ components:
             - { type: integer, minimum: 0 }
             - { type: integer, maximum: -10 }
             - { type: 'null' }
+        data: { $ref: '#/components/schemas/JsonValue' }
     Summary:
       type: object
       required: [id, flag]
@@ -152,3 +153,13 @@ components:
       oneOf:
         - { type: string }
         - { type: string, pattern: '\s' }
+    JsonValue:
+      anyOf:
+        - { type: string }
+        - { type: number }
+        - { type: boolean }
+        - { type: 'null' }
+        - { type: array, items: { $ref: '#/components/schemas/JsonValue' } }
+        - type: object
+          propertyNames: { type: string }
+          additionalProperties: { $ref: '#/components/schemas/JsonValue' }

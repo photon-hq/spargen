@@ -838,6 +838,36 @@ fn textual_documented_errors_decode_without_json_quotes() {
 }
 
 #[test]
+fn a_documented_not_modified_is_a_result_not_an_error() {
+    let (base, server) = serve_once("application/json", "304 Not Modified", b"");
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    let response = client.get_cached().expect("a documented 304 is not an error");
+    assert_eq!(response.status(), 304);
+    assert!(matches!(
+        response.into_inner(),
+        basic_client::GetCachedResponse::Status304
+    ));
+    server.join().unwrap();
+
+    let (base, server) = serve_once("application/json", "200 OK", b"{\"v\":\"x\"}");
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    match client.get_cached().unwrap().into_inner() {
+        basic_client::GetCachedResponse::Status200(body) => assert_eq!(body.v, "x"),
+        other => panic!("expected the 200 variant, got {other:?}"),
+    }
+    server.join().unwrap();
+
+    // A status the operation does not declare is still an error.
+    let (base, server) = serve_once("application/json", "412 Precondition Failed", b"\"no\"");
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    match client.get_cached().unwrap_err() {
+        basic_client::Error::UnexpectedStatus { status, .. } => assert_eq!(status, 412),
+        other => panic!("expected an unexpected-status error, got {other:?}"),
+    }
+    server.join().unwrap();
+}
+
+#[test]
 fn multi_status_dispatch_uses_each_status_media_codec() {
     let (base, server) = serve_once("text/plain", "200 OK", b"plain success");
     let client = basic_client::BlockingClient::new(&base).unwrap();
@@ -2293,6 +2323,26 @@ paths:
           description: textual failure
           content:
             text/plain:
+              schema: { type: string }
+  # A documented 304 answers a conditional request: a success-side unit variant, not an error.
+  /cached:
+    get:
+      operationId: getCached
+      responses:
+        "200":
+          description: the current representation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [v]
+                properties:
+                  v: { type: string }
+        "304": { description: not modified }
+        "404":
+          description: missing
+          content:
+            application/json:
               schema: { type: string }
   /raw-multi:
     get:
