@@ -228,7 +228,7 @@ impl Responses {
         let success: Vec<&(StatusSpec, Response)> = self
             .by_status
             .iter()
-            .filter(|(status, _)| is_success_status(*status))
+            .filter(|(status, _)| self.is_success_side(*status))
             .collect();
         let mut bodied = success
             .iter()
@@ -322,13 +322,44 @@ impl Responses {
         success_multi || error_multi
     }
 
+    /// Whether a documented `304 Not Modified` is decoded as a success-side outcome rather than an
+    /// error: it answers a conditional request, so it joins the 2xx statuses (as a unit variant of
+    /// the success enum). The exception is a lone streaming or XML success body, whose decode path
+    /// is single-body only, and a `304` documented with a body, which HTTP never sends; there `304`
+    /// stays a documented error status.
+    pub fn not_modified_is_outcome(&self) -> bool {
+        if !self
+            .by_status
+            .iter()
+            .any(|(status, response)| *status == StatusSpec::Exact(304) && response.body.is_none())
+        {
+            return false;
+        }
+        let mut bodied = self
+            .by_status
+            .iter()
+            .filter(|(status, response)| status.is_success() && response.body.is_some());
+        match (bodied.next(), bodied.next()) {
+            (Some((_, response)), None) => {
+                response.stream.is_none() && response.media != Some(MediaType::Xml)
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether a documented status is decoded on the success side: every 2xx status, plus `304`
+    /// when [`Self::not_modified_is_outcome`]. Every other status is an error.
+    pub fn is_success_side(&self, status: StatusSpec) -> bool {
+        status.is_success() || (status == StatusSpec::Exact(304) && self.not_modified_is_outcome())
+    }
+
     /// The operation's error responses: every non-success explicit status plus the `default`
     /// response (which matches any status). Mirrors the entry set built by [`Self::error`].
     fn error_responses(&self) -> Vec<&Response> {
         let mut responses: Vec<&Response> = self
             .by_status
             .iter()
-            .filter(|(status, _)| !is_success_status(*status))
+            .filter(|(status, _)| !self.is_success_side(*status))
             .map(|(_, response)| response)
             .collect();
         if let Some(default) = &self.default {
@@ -346,7 +377,7 @@ impl Responses {
         }
         self.by_status
             .iter()
-            .filter(|(status, _)| is_success_status(*status))
+            .filter(|(status, _)| self.is_success_side(*status))
             .map(|(_, response)| response)
             .collect()
     }
@@ -359,7 +390,7 @@ impl Responses {
     pub fn error(&self) -> ErrorShape {
         let mut entries: Vec<(StatusSpec, Option<Ty>)> = Vec::new();
         for (status, response) in &self.by_status {
-            if !is_success_status(*status) {
+            if !self.is_success_side(*status) {
                 entries.push((*status, response.body));
             }
         }
@@ -405,10 +436,6 @@ fn precedence_key(status: StatusSpec) -> (u8, u16) {
         StatusSpec::Range(0) => (2, 0),
         StatusSpec::Range(prefix) => (1, u16::from(prefix)),
     }
-}
-
-fn is_success_status(status: StatusSpec) -> bool {
-    status.is_success()
 }
 
 /// The success return type of an operation (before wrapping in `ResponseValue<T>`).

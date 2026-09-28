@@ -731,7 +731,9 @@ pub(crate) fn emit_operation(
                 .responses
                 .by_status
                 .iter()
-                .filter(|(status, response)| !status.is_success() && response.body.is_some())
+                .filter(|(status, response)| {
+                    !operation.responses.is_success_side(*status) && response.body.is_some()
+                })
                 .map(|(status, _)| match status {
                     crate::ir::StatusSpec::Exact(code) => {
                         quote! { support::StatusSpec::Exact(#code) }
@@ -961,6 +963,15 @@ pub(crate) fn emit_operation(
         .responses
         .stream_success()
         .map(|(framing, _)| framing);
+    // A documented `304 Not Modified` is a success-side outcome, decoded with the 2xx statuses.
+    let is_success = if operation.responses.not_modified_is_outcome() {
+        quote! {
+            response.status().is_success()
+                || response.status() == reqwest::StatusCode::NOT_MODIFIED
+        }
+    } else {
+        quote! { response.status().is_success() }
+    };
     let success_decode = match stream_framing {
         Some(framing) => {
             let framing_tokens = match framing {
@@ -1048,7 +1059,7 @@ pub(crate) fn emit_operation(
             let response = support::send(&self.core, #request_binding)
                 .await
                 .map_err(support::Error::widen)?;
-            if response.status().is_success() {
+            if #is_success {
                 #success_decode
             } else {
                 #error_branch
