@@ -151,9 +151,9 @@ Key points of the surface:
   request-construction error, never a silent 401.
 - A closed [error taxonomy](./errors.md), identical across all spargen output:
   request-construction, transport, timeout, protocol, redirect, documented API error (typed `E`),
-  undocumented status (raw body preserved), decode failure, interrupted body.
-  `Error::is_transient()` classifies retry-worthy failures — spargen ships no retry policy, but
-  the runtime offers a bring-your-own [retry adapter](./runtime.md).
+  undocumented status (raw body preserved), decode failure (status and headers kept),
+  interrupted body. `Error::is_transient()` classifies retry-worthy failures — spargen ships no
+  retry policy, but the runtime offers a bring-your-own [retry adapter](./runtime.md).
 - Spec `title`/`summary`/`description` become rustdoc; `deprecated` becomes `#[deprecated]`.
 
 ## Next steps

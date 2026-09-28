@@ -35,9 +35,15 @@ pub enum Error<E> {
         /// The raw response body.
         body: Bytes,
     },
-    /// #8 — the response body failed to deserialize; retains the serde error path and (capped) raw
-    /// body.
+    /// #8 — the response body failed to deserialize; retains the response status and headers (so
+    /// the status and a request-ID header survive a body the client cannot read), the serde error
+    /// path, and the (capped) raw body. For a streamed item they are those of the response that
+    /// carried the malformed frame.
     Decode {
+        /// The response status.
+        status: StatusCode,
+        /// The response headers.
+        headers: HeaderMap,
         /// The serde deserialization error path.
         path: String,
         /// The retained raw body (up to the configured cap).
@@ -125,10 +131,14 @@ impl Error<std::convert::Infallible> {
                 body,
             },
             Error::Decode {
+                status,
+                headers,
                 path,
                 body,
                 truncated,
             } => Error::Decode {
+                status,
+                headers,
                 path,
                 body,
                 truncated,
@@ -150,7 +160,9 @@ impl<E: std::fmt::Display> std::fmt::Display for Error<E> {
             Error::UnexpectedStatus { status, .. } => {
                 write!(f, "unexpected response status {status}")
             }
-            Error::Decode { path, .. } => write!(f, "response decode failed at {path}"),
+            Error::Decode { status, path, .. } => {
+                write!(f, "response decode failed for status {status} at {path}")
+            }
             Error::InterruptedBody(_) => f.write_str("response body was interrupted"),
         }
     }

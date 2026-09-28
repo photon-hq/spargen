@@ -78,8 +78,9 @@ the version it emits, and the idioms spargen handles.
   A missing required credential is a request-construction error, never a silent 401.
 - A closed error taxonomy, identical across all spargen output: request-construction, transport,
   timeout, protocol, redirect, documented API error (typed `E`), undocumented status (raw body
-  preserved), decode failure (serde path + capped body), interrupted body. `Error::is_transient()`
-  classifies retry-worthy failures so any caller-side retry policy is trivial; spargen ships none.
+  preserved), decode failure (response status and headers, serde path + capped body), interrupted
+  body. `Error::is_transient()` classifies retry-worthy failures so any caller-side retry policy is
+  trivial; spargen ships none.
 - Spec `title`/`summary`/`description` become rustdoc; `deprecated` becomes `#[deprecated]`.
 
 ### Design guarantees

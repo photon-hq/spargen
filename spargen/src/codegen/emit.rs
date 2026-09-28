@@ -824,6 +824,8 @@ pub(crate) fn emit_operation(
                                         #error_ident::#variant_ident(value),
                                     )),
                                     Err(path) => support::Error::Decode {
+                                        status,
+                                        headers,
                                         path,
                                         body,
                                         truncated,
@@ -913,6 +915,8 @@ pub(crate) fn emit_operation(
                             if #spec_tokens.matches(status) {
                                 let value = #decode
                                     .map_err(|path| support::Error::<#error_ty>::Decode {
+                                        status,
+                                        headers: headers.clone(),
                                         path,
                                         body: body.clone(),
                                         truncated: false,
