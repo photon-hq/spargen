@@ -33,6 +33,19 @@ mod exact_json_tests {
     }
 
     #[test]
+    fn free_form_json_keeps_integers_and_floats_apart() {
+        // A union's `number` member takes any JSON number, so it must not turn `1` into `1.0`.
+        accepts("data", json!({"parts": 1}));
+        accepts("data", json!({"x": 1.5}));
+        accepts("data", json!([1, -2, 2.5, u64::MAX, {"n": 0}]));
+        accepts("data", json!(7));
+        let mut input = item();
+        input["data"] = json!({"parts": 1});
+        let encoded = serde_json::to_string(&decode(input).unwrap()).unwrap();
+        assert!(encoded.contains(r#""data":{"parts":1}"#), "{encoded}");
+    }
+
+    #[test]
     fn open_prefix_items_and_typed_maps() {
         accepts("prefix", json!([]));
         accepts("prefix", json!(["*", 5, {}]));
