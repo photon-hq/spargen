@@ -198,20 +198,19 @@ pub fn lower(
             }
 
             let responses = ctx.lower_responses(&operation.responses);
-            // XML decode is scoped to the single-body success/error paths. An XML body that would
-            // land in a multi-status response enum is rejected cleanly (narrowed `E009`) rather than
-            // silently decoded as JSON.
+            // XML success decode is scoped to the single-body path. An XML body that would land in
+            // a multi-status success enum is rejected cleanly (narrowed `E009`) rather than
+            // silently decoded as JSON; error enums decode XML per variant.
             if responses.xml_in_multi_status() {
                 Diagnostic::error(Code::UnsupportedMediaType, operation.provenance.clone())
                     .message(
-                        "an application/xml (or text/xml) response body is only supported as an \
-                         operation's single success or single error body; it cannot participate in \
-                         a multi-status response enum",
+                        "an application/xml (or text/xml) success body is only supported as an \
+                         operation's single success body; it cannot participate in a multi-status \
+                         success enum",
                     )
                     .remedy(
-                        "give the operation a single XML-bodied success/error response, use JSON \
-                         for the multi-status responses, or omit this API segment with \
-                         spargen::omit!",
+                        "give the operation a single XML-bodied success response, use JSON for \
+                         the multi-status successes, or omit this API segment with spargen::omit!",
                     )
                     .emit(ctx.diags);
             }

@@ -902,6 +902,41 @@ fn multi_status_dispatch_uses_each_status_media_codec() {
     }
     server.join().unwrap();
 }
+
+#[test]
+fn xml_error_enum_types_every_documented_status() {
+    let order = basic_client::types::XmlOrder {
+        id: 1,
+        sku: "ABC".to_owned(),
+    };
+    let (base, server) = serve_once(
+        "application/xml",
+        "422 Unprocessable Entity",
+        b"<XmlReceipt><ReceiptCode>BAD</ReceiptCode></XmlReceipt>",
+    );
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    match client.submit_order(&order).unwrap_err() {
+        basic_client::Error::Api(response) => match response.into_inner() {
+            basic_client::SubmitOrderError::Status422(receipt) => assert_eq!(receipt.code, "BAD"),
+            other => panic!("expected XML 422 variant, got {other:?}"),
+        },
+        other => panic!("expected typed API error, got {other:?}"),
+    }
+    server.join().unwrap();
+
+    let (base, server) = serve_once("text/plain", "404 Not Found", b"");
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    match client.submit_order(&order).unwrap_err() {
+        basic_client::Error::Api(response) => {
+            assert!(matches!(
+                response.into_inner(),
+                basic_client::SubmitOrderError::Status404
+            ))
+        }
+        other => panic!("expected typed API error, got {other:?}"),
+    }
+    server.join().unwrap();
+}
 "##,
     )
     .unwrap();
@@ -2373,6 +2408,8 @@ paths:
   # Cargo.toml enabled quick-xml (the `xml` feature) and that the embedded `support::xml` helpers
   # (`to_xml`, `decode_success_xml`) compile. `id` carries `xml.attribute` (serde `@id`) and `code`
   # an `xml.name` rename; both are honored, an unsupported `xml.namespace` on `note` warns (W006).
+  # The XML-bodied `422` beside a bodyless `404` lowers to an error enum whose `422` variant
+  # decodes through `support::decode_xml_body`, so both documented statuses are `Error::Api`.
   /xml/order:
     post:
       operationId: submitOrder
@@ -2385,6 +2422,14 @@ paths:
       responses:
         "200":
           description: OK
+          content:
+            application/xml:
+              schema:
+                $ref: "#/components/schemas/XmlReceipt"
+        "404":
+          description: No such order
+        "422":
+          description: Rejected order
           content:
             application/xml:
               schema:
@@ -4150,6 +4195,177 @@ fn a_bodyless_sibling_of_a_bodied_success_is_not_decoded() {
     assert!(
         status.success(),
         "every documented success status must reach the caller as its own variant"
+    );
+}
+
+/// Every documented error status is a typed `Error::Api` outcome, with or without a body. Before
+/// the fix a bodyless `400` beside one bodied `503` collapsed the error type to the `503` body (the
+/// `400` became `UnexpectedStatus`), and an operation whose only error was a bodyless `400` got an
+/// uninhabited error type. A builder setter named after a trait method (`default`, `clone`) or a
+/// server struct's own method (`url`) gets a trailing underscore; before the fix
+/// `…Params::default()` resolved to the setter and did not compile.
+#[test]
+fn bodyless_error_statuses_are_api_errors_and_setters_do_not_shadow_trait_methods() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = temp.path().join("openapi.yaml");
+    std::fs::write(
+        &spec,
+        r##"
+openapi: 3.1.0
+info: { title: Errors, version: 1.0.0 }
+servers:
+  - url: "https://{url}.example.com/{default}"
+    variables:
+      url: { default: api }
+      default: { default: v1 }
+paths:
+  /device/code:
+    post:
+      operationId: deviceAuthorize
+      responses:
+        "200":
+          description: Started.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code]
+                properties: { code: { type: string } }
+        "400": { description: Rejected. }
+        "503":
+          description: Unavailable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [title]
+                properties: { title: { type: string } }
+  /logout:
+    post:
+      operationId: logout
+      responses:
+        "204": { description: Signed out. }
+        "400": { description: Rejected. }
+  /profiles:
+    get:
+      operationId: listProfiles
+      parameters:
+        - { name: default, in: query, schema: { type: boolean } }
+        - { name: clone, in: query, schema: { type: string } }
+        - { name: pageSize, in: query, schema: { type: integer } }
+      responses:
+        "204": { description: Listed. }
+"##,
+    )
+    .unwrap();
+    let out = temp.path().join("client");
+    let report = generate_fixture_crate(&spec, &out, "errors_client");
+    assert_eq!(report.outcome, Outcome::Generated, "{report:#?}");
+
+    std::fs::create_dir_all(out.join("tests")).unwrap();
+    std::fs::write(
+        out.join("tests/errors.rs"),
+        r##"#![cfg(feature = "blocking")]
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
+use errors_client::{
+    servers::Server, BlockingClient, DeviceAuthorizeError, Error, ListProfilesParams, LogoutError,
+};
+
+/// Serve each canned response to one connection, in order, returning each request line.
+fn serve(
+    responses: &'static [&'static [u8]],
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        for response in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let read = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+            lines.push(request.lines().next().unwrap().to_owned());
+            stream.write_all(response).unwrap();
+            stream.flush().unwrap();
+        }
+        lines
+    });
+    (base, server)
+}
+
+#[test]
+fn every_documented_error_status_is_an_api_error() {
+    let (base, server) = serve(&[
+        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"title\":\"down\"}",
+        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]);
+    let client = BlockingClient::new(&base).unwrap();
+
+    match client.device_authorize().unwrap_err() {
+        Error::Api(value) => {
+            assert_eq!(value.status().as_u16(), 400);
+            assert!(matches!(value.into_inner(), DeviceAuthorizeError::Status400));
+        }
+        other => panic!("expected Api, got {other:?}"),
+    }
+    match client.device_authorize().unwrap_err() {
+        Error::Api(value) => match value.into_inner() {
+            DeviceAuthorizeError::Status503(body) => assert_eq!(body.title, "down"),
+            other => panic!("expected Status503, got {other:?}"),
+        },
+        other => panic!("expected Api, got {other:?}"),
+    }
+    // An operation whose only documented error has no body still types it.
+    match client.logout().unwrap_err() {
+        Error::Api(value) => assert!(matches!(value.into_inner(), LogoutError::Status400)),
+        other => panic!("expected Api, got {other:?}"),
+    }
+    // An undocumented status stays UnexpectedStatus.
+    assert!(matches!(
+        client.logout().unwrap_err(),
+        Error::UnexpectedStatus { .. }
+    ));
+    server.join().unwrap();
+}
+
+#[test]
+fn setters_named_after_trait_methods_get_a_trailing_underscore() {
+    // `Default::default`, `Clone::clone` and the server struct's `new`/`url` stay callable.
+    let params = ListProfilesParams::default()
+        .default_(true)
+        .clone_("a".to_owned())
+        .page_size(5);
+    let copy = params.clone();
+    assert_eq!(copy.default, Some(true));
+    assert_eq!(copy.clone, Some("a".to_owned()));
+    assert_eq!(
+        Server::new().url_("eu").default_("v2").url(),
+        "https://eu.example.com/v2"
+    );
+
+    let (base, server) = serve(&[b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"]);
+    let client = BlockingClient::new(&base).unwrap();
+    client.list_profiles(Some(params)).unwrap();
+    let lines = server.join().unwrap();
+    assert_eq!(lines[0], "GET /profiles?default=true&clone=a&pageSize=5 HTTP/1.1");
+}
+"##,
+    )
+    .unwrap();
+
+    let status = Command::new("cargo")
+        .args(["test", "--features", "blocking", "--test", "errors"])
+        .current_dir(&out)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "every documented error status must be an Error::Api variant and setters must not shadow trait methods"
     );
 }
 

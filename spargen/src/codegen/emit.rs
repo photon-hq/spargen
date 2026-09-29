@@ -792,7 +792,7 @@ pub(crate) fn emit_operation(
                 Err(#classify)
             }
         }
-        // Multiple documented error bodies: read the capped body once, then dispatch by status in
+        // An error enum: read the capped body once, then dispatch by status in
         // precedence order (exact before range before default) into the matching enum variant →
         // `Error::Api`; a parse failure → `Error::Decode`; an undocumented status →
         // `Error::UnexpectedStatus` (capped body preserved either way).
@@ -807,14 +807,18 @@ pub(crate) fn emit_operation(
                         let ty = response_payload_ty_tokens(body_ty, names, options, true);
                         let decode = if is_bytes_ty(api, body_ty) {
                             quote! { Ok::<#ty, String>(Box::new(body.clone())) }
-                        } else if response_media_for_spec(&operation.responses, *spec)
-                            == Some(MediaType::Text)
-                        {
-                            quote! { support::decode_text_body::<#ty>(&body) }
                         } else {
-                            quote! {
-                                serde_json::from_slice::<#ty>(&body)
-                                    .map_err(|error| error.to_string())
+                            match response_media_for_spec(&operation.responses, *spec) {
+                                Some(MediaType::Text) => {
+                                    quote! { support::decode_text_body::<#ty>(&body) }
+                                }
+                                Some(MediaType::Xml) => {
+                                    quote! { support::decode_xml_body::<#ty>(&body) }
+                                }
+                                _ => quote! {
+                                    serde_json::from_slice::<#ty>(&body)
+                                        .map_err(|error| error.to_string())
+                                },
                             }
                         };
                         quote! {
@@ -1580,42 +1584,60 @@ fn emit_servers(api: &Api, names: &Names) -> TokenStream {
             }
         });
 
-        let setters = server.variables.iter().map(|(name, variable)| {
-            let field = names
-                .server_variable_fields
-                .get(&(index, name.clone()))
-                .expect("server variable field allocated");
-            let field = proc_macro2::Ident::new(field.as_str(), proc_macro2::Span::call_site());
-            let mut doc = format!("Set the `{name}` server variable.");
-            if let Some(description) = &variable.description {
-                doc.push(' ');
-                doc.push_str(description);
-            }
-            match names.server_variable_enums.get(&(index, name.clone())) {
-                Some(enum_ident) => {
-                    let enum_ident = proc_macro2::Ident::new(
-                        enum_ident.as_str(),
-                        proc_macro2::Span::call_site(),
-                    );
-                    quote! {
-                        #[doc = #doc]
-                        #[must_use]
-                        pub fn #field(mut self, value: #enum_ident) -> Self {
-                            self.#field = value;
-                            self
+        // Setters are named after their fields, but must not shadow a trait method or the
+        // struct's own `new`/`url`.
+        let setter_names = setter_idents(
+            server.variables.iter().map(|(name, _)| {
+                let field = names
+                    .server_variable_fields
+                    .get(&(index, name.clone()))
+                    .expect("server variable field allocated");
+                proc_macro2::Ident::new(field.as_str(), proc_macro2::Span::call_site())
+            }),
+            &["new", "url"],
+        );
+        let setters =
+            server
+                .variables
+                .iter()
+                .zip(&setter_names)
+                .map(|((name, variable), setter)| {
+                    let field = names
+                        .server_variable_fields
+                        .get(&(index, name.clone()))
+                        .expect("server variable field allocated");
+                    let field =
+                        proc_macro2::Ident::new(field.as_str(), proc_macro2::Span::call_site());
+                    let mut doc = format!("Set the `{name}` server variable.");
+                    if let Some(description) = &variable.description {
+                        doc.push(' ');
+                        doc.push_str(description);
+                    }
+                    match names.server_variable_enums.get(&(index, name.clone())) {
+                        Some(enum_ident) => {
+                            let enum_ident = proc_macro2::Ident::new(
+                                enum_ident.as_str(),
+                                proc_macro2::Span::call_site(),
+                            );
+                            quote! {
+                                #[doc = #doc]
+                                #[must_use]
+                                pub fn #setter(mut self, value: #enum_ident) -> Self {
+                                    self.#field = value;
+                                    self
+                                }
+                            }
                         }
+                        None => quote! {
+                            #[doc = #doc]
+                            #[must_use]
+                            pub fn #setter(mut self, value: impl Into<String>) -> Self {
+                                self.#field = value.into();
+                                self
+                            }
+                        },
                     }
-                }
-                None => quote! {
-                    #[doc = #doc]
-                    #[must_use]
-                    pub fn #field(mut self, value: impl Into<String>) -> Self {
-                        self.#field = value.into();
-                        self
-                    }
-                },
-            }
-        });
+                });
 
         let pieces = server.segments.iter().map(|segment| match segment {
             // A one-character literal goes through `push`: `push_str` with a single-char literal
@@ -2207,9 +2229,60 @@ fn client_doc_tokens(api: &Api) -> TokenStream {
     quote! { #[doc = #text] }
 }
 
+/// Methods of the traits every generated builder struct implements: its derives (`Debug`, `Clone`,
+/// `Default`, `Serialize`) and the blanket impls of `From`/`Into`, `TryFrom`/`TryInto`, `ToOwned`,
+/// `Borrow`/`BorrowMut` and `Any`. An inherent setter with one of these names shadows the trait
+/// method, so `…Params::default()` or `params.clone()` would resolve to the one-argument setter and
+/// fail to compile.
+const TRAIT_METHOD_NAMES: &[&str] = &[
+    "borrow",
+    "borrow_mut",
+    "clone",
+    "clone_from",
+    "clone_into",
+    "default",
+    "fmt",
+    "from",
+    "into",
+    "serialize",
+    "to_owned",
+    "try_from",
+    "try_into",
+    "type_id",
+];
+
+/// The setter method names for a builder's fields, in field order. A setter is named after its
+/// field, except that a name in [`TRAIT_METHOD_NAMES`] or `reserved` (the builder's other inherent
+/// methods) gets a trailing underscore (`default` → `default_`), repeated until it is unique.
+fn setter_idents(
+    fields: impl Iterator<Item = proc_macro2::Ident>,
+    reserved: &[&str],
+) -> Vec<proc_macro2::Ident> {
+    let fields: Vec<proc_macro2::Ident> = fields.collect();
+    let mut taken: std::collections::HashSet<String> =
+        fields.iter().map(|field| field.to_string()).collect();
+    fields
+        .into_iter()
+        .map(|field| {
+            let spelling = field.to_string();
+            if !TRAIT_METHOD_NAMES.contains(&spelling.as_str())
+                && !reserved.contains(&spelling.as_str())
+            {
+                return field;
+            }
+            let mut renamed = format!("{spelling}_");
+            while !taken.insert(renamed.clone()) {
+                renamed.push('_');
+            }
+            proc_macro2::Ident::new(&renamed, proc_macro2::Span::call_site())
+        })
+        .collect()
+}
+
 /// Emit an operation's optional-parameters `…Params` struct (deriving `Default`, public fields)
 /// plus an `impl` of fluent `#[must_use]` consuming setters — one per optional param, named after
-/// its field — so callers can write `…Params::default().foo(x).bar(y)` instead of a struct literal.
+/// its field (see [`setter_idents`] for the trait-method exception) — so callers can write
+/// `…Params::default().foo(x).bar(y)` instead of a struct literal.
 pub(crate) fn emit_params_struct(
     operation: &Operation,
     names: &Names,
@@ -2224,10 +2297,11 @@ pub(crate) fn emit_params_struct(
         .iter()
         .filter(|param| !param.required)
         .collect();
-    // The setter method reuses the field ident verbatim (same escaping/keyword handling), so
-    // build it once per param.
+    // The setter method reuses the field ident (same escaping/keyword handling), except where
+    // that spelling would shadow a trait method (see `setter_idents`).
     let field_ident =
         |param: &crate::ir::Parameter| escaped_token(&param.name, crate::name::IdentRole::Field);
+    let setter_names = setter_idents(optional.iter().map(|param| field_ident(param)), &[]);
     let fields = optional.iter().map(|param| {
         let ident = field_ident(param);
         let wire = &param.name;
@@ -2264,7 +2338,7 @@ pub(crate) fn emit_params_struct(
     // param's field is `Option<T>` for the same reason an ordinary optional param's is, so both
     // accept `T`. `T`-by-value (not `impl Into<T>`) keeps inference/coherence trivial for every
     // generated field type.
-    let setters = optional.iter().map(|param| {
+    let setters = optional.iter().zip(&setter_names).map(|(param, setter)| {
         let ident = field_ident(param);
         let inner = ty_tokens(
             Ty {
@@ -2279,7 +2353,7 @@ pub(crate) fn emit_params_struct(
         quote! {
             #[doc = #doc]
             #[must_use]
-            pub fn #ident(mut self, value: #inner) -> Self {
+            pub fn #setter(mut self, value: #inner) -> Self {
                 self.#ident = Some(value);
                 self
             }
@@ -2350,7 +2424,8 @@ fn response_variant_def(
     }
 }
 
-/// Emit an operation's typed error enum (or type alias for a single error body).
+/// Emit an operation's typed error enum (or a type alias when the only documented error status
+/// has a body).
 pub(crate) fn emit_error_enum(
     operation: &Operation,
     names: &Names,
@@ -2362,7 +2437,7 @@ pub(crate) fn emit_error_enum(
         .expect("operation name allocated");
     let error_ident = format_ident!("{}Error", to_pascal(method_ident.as_str()));
     match operation.responses.error() {
-        // Multiple documented error bodies → a payload-carrying enum, one variant per status. The
+        // Several documented error statuses, or a bodyless one → an enum, one variant per status. The
         // variant is chosen by HTTP status at classification time, so it derives no whole-enum
         // `Deserialize` (and never `serde(untagged)`); each variant's body is decoded on its own.
         ErrorShape::Enum(entries) => {
@@ -2377,7 +2452,7 @@ pub(crate) fn emit_error_enum(
                 }
             }
         }
-        // A single documented error body: a plain alias to that type.
+        // A single documented error status with a body: a plain alias to that type.
         ErrorShape::Single(ty) => {
             let ty = ty_tokens(ty, names, options, true);
             quote! {
@@ -2385,7 +2460,7 @@ pub(crate) fn emit_error_enum(
                 pub type #error_ident = #ty;
             }
         }
-        // No documented error body: every non-success status is Error::UnexpectedStatus, and the
+        // No documented error status: every non-success status is Error::UnexpectedStatus, and the
         // uninhabited alias makes Error::Api impossible to construct.
         ErrorShape::None => quote! {
             #[allow(dead_code)]
@@ -2434,7 +2509,7 @@ pub(crate) fn emit_support(uses_xml: bool, uses_streams: bool, uses_time: bool) 
     // dependency audit require `quick-xml` of the consumer. A non-XML output never references it.
     let xml_module = uses_xml.then(|| embed(&crate::support::xml_runtime_file()));
     let xml_reexport = uses_xml.then(|| {
-        quote! { pub use xml::{classify_error_xml, decode_success_xml, to_xml}; }
+        quote! { pub use xml::{classify_error_xml, decode_success_xml, decode_xml_body, to_xml}; }
     });
     // The RFC 3339 newtypes are embedded only when a date-typed primitive survives lowering with the
     // `time` mapping enabled; only then does the audit require `time` of the consumer.

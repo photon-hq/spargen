@@ -2744,7 +2744,7 @@ components:
 
 #[test]
 fn xml_body_in_multi_status_enum_is_rejected() {
-    // Issue #13: XML decode is scoped to single-body success/error. An XML body that would land in a
+    // Issue #13: XML success decode is scoped to the single-body path. An XML body that would land in a
     // multi-status success enum (two bodied success statuses) is rejected cleanly with narrowed E009
     // rather than silently decoded as JSON.
     let spec = r##"
