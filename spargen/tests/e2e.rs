@@ -902,6 +902,41 @@ fn multi_status_dispatch_uses_each_status_media_codec() {
     }
     server.join().unwrap();
 }
+
+#[test]
+fn xml_error_enum_types_every_documented_status() {
+    let order = basic_client::types::XmlOrder {
+        id: 1,
+        sku: "ABC".to_owned(),
+    };
+    let (base, server) = serve_once(
+        "application/xml",
+        "422 Unprocessable Entity",
+        b"<XmlReceipt><ReceiptCode>BAD</ReceiptCode></XmlReceipt>",
+    );
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    match client.submit_order(&order).unwrap_err() {
+        basic_client::Error::Api(response) => match response.into_inner() {
+            basic_client::SubmitOrderError::Status422(receipt) => assert_eq!(receipt.code, "BAD"),
+            other => panic!("expected XML 422 variant, got {other:?}"),
+        },
+        other => panic!("expected typed API error, got {other:?}"),
+    }
+    server.join().unwrap();
+
+    let (base, server) = serve_once("text/plain", "404 Not Found", b"");
+    let client = basic_client::BlockingClient::new(&base).unwrap();
+    match client.submit_order(&order).unwrap_err() {
+        basic_client::Error::Api(response) => {
+            assert!(matches!(
+                response.into_inner(),
+                basic_client::SubmitOrderError::Status404
+            ))
+        }
+        other => panic!("expected typed API error, got {other:?}"),
+    }
+    server.join().unwrap();
+}
 "##,
     )
     .unwrap();
@@ -2373,6 +2408,8 @@ paths:
   # Cargo.toml enabled quick-xml (the `xml` feature) and that the embedded `support::xml` helpers
   # (`to_xml`, `decode_success_xml`) compile. `id` carries `xml.attribute` (serde `@id`) and `code`
   # an `xml.name` rename; both are honored, an unsupported `xml.namespace` on `note` warns (W006).
+  # The XML-bodied `422` beside a bodyless `404` lowers to an error enum whose `422` variant
+  # decodes through `support::decode_xml_body`, so both documented statuses are `Error::Api`.
   /xml/order:
     post:
       operationId: submitOrder
@@ -2385,6 +2422,14 @@ paths:
       responses:
         "200":
           description: OK
+          content:
+            application/xml:
+              schema:
+                $ref: "#/components/schemas/XmlReceipt"
+        "404":
+          description: No such order
+        "422":
+          description: Rejected order
           content:
             application/xml:
               schema:

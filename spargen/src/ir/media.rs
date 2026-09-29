@@ -9,8 +9,8 @@ pub enum MediaType {
     FormUrlEncoded,
     /// `application/xml` / `text/xml`: a body serialized/deserialized as XML via the runtime's
     /// feature-gated `quick-xml` codec. Lowers to the same struct type `T` as JSON; JSON still wins
-    /// when both are offered. Scoped to single-body request/response bodies (see
-    /// [`Responses::xml_in_multi_status`]).
+    /// when both are offered. Supported for request bodies, a single success body, and error
+    /// bodies (see [`Responses::xml_in_multi_status`]).
     Xml,
     /// `application/octet-stream` (raw bytes).
     OctetStream,
@@ -309,17 +309,16 @@ impl Responses {
         }
     }
 
-    /// Whether an XML body appears in a response position that lowers to a *multi-status* enum
-    /// (two or more bodied success or error statuses). XML decode is scoped to the single-body
-    /// success/error paths, so this exotic combination is rejected cleanly during lowering (narrowed
-    /// `E009`) rather than silently mis-decoding an XML body as JSON.
+    /// Whether an XML body appears in a *multi-status success* enum (two or more bodied success
+    /// statuses). XML success decode is scoped to the single-body path, so this exotic combination
+    /// is rejected cleanly during lowering (narrowed `E009`) rather than silently mis-decoding an
+    /// XML body as JSON. Error enums decode each variant through its own codec, XML included.
     pub fn xml_in_multi_status(&self) -> bool {
-        let is_xml = |response: &&Response| response.media == Some(MediaType::Xml);
-        let success_multi = matches!(self.success(), SuccessShape::Enum(_))
-            && self.success_responses().iter().any(is_xml);
-        let error_multi = matches!(self.error(), ErrorShape::Enum(_))
-            && self.error_responses().iter().any(is_xml);
-        success_multi || error_multi
+        matches!(self.success(), SuccessShape::Enum(_))
+            && self
+                .success_responses()
+                .iter()
+                .any(|response| response.media == Some(MediaType::Xml))
     }
 
     /// Whether a documented `304 Not Modified` is decoded as a success-side outcome rather than an
@@ -390,10 +389,6 @@ impl Responses {
     /// one. Every documented error status therefore decodes to `Error::Api`, bodyless or not; only
     /// an undocumented status is `Error::UnexpectedStatus`. `default` contributes here (as
     /// `Range(0)`) whenever it is not the sole success source.
-    ///
-    /// The exception is a lone XML error body: that decode path is scoped to the single-body case
-    /// (see [`Self::xml_in_multi_status`]), so it stays `Single` and its bodyless siblings remain
-    /// `Error::UnexpectedStatus`.
     pub fn error(&self) -> ErrorShape {
         let mut entries: Vec<(StatusSpec, Option<Ty>)> = Vec::new();
         for (status, response) in &self.by_status {
@@ -404,17 +399,9 @@ impl Responses {
         if let Some(default) = &self.default {
             entries.push((StatusSpec::Range(0), default.body));
         }
-        let mut bodies = entries.iter().filter_map(|(_, body)| *body);
-        let lone_body = match (bodies.next(), bodies.next()) {
-            (Some(body), None) => Some(body),
-            _ => None,
-        };
-        match (entries.as_slice(), lone_body) {
-            ([], _) => ErrorShape::None,
-            ([(_, Some(body))], _) => ErrorShape::Single(*body),
-            (_, Some(body)) if self.single_error_media() == Some(MediaType::Xml) => {
-                ErrorShape::Single(body)
-            }
+        match entries.as_slice() {
+            [] => ErrorShape::None,
+            [(_, Some(body))] => ErrorShape::Single(*body),
             _ => {
                 entries.sort_by_key(|(status, _)| precedence_key(*status));
                 ErrorShape::Enum(entries)
@@ -601,9 +588,10 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_xml_error_body_stays_single_beside_a_bodyless_status() {
-        // XML error decoding is single-body only, so the bodyless sibling is not modeled rather
-        // than turning the operation into a rejected multi-status XML shape.
+    fn a_lone_xml_error_body_beside_a_bodyless_status_is_an_enum() {
+        // The bodyless sibling is still a documented status, so it gets its own unit variant (and
+        // `Error::Api`) instead of collapsing to the XML body; error enums decode XML per variant,
+        // so the shape is not rejected.
         let mut xml = resp(Some(2));
         xml.media = Some(super::MediaType::Xml);
         let responses = Responses {
@@ -614,7 +602,13 @@ mod tests {
             ],
             default: None,
         };
-        assert!(matches!(responses.error(), ErrorShape::Single(ty) if ty.id == TypeId(2)));
+        assert_eq!(
+            error_statuses(&responses),
+            vec![
+                (StatusSpec::Exact(400), true),
+                (StatusSpec::Exact(404), false)
+            ]
+        );
         assert!(!responses.xml_in_multi_status());
     }
 
